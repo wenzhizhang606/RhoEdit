@@ -59,7 +59,7 @@ def get_arguments():
         required=True,
         type=str,
         default="zsre",
-        choices=["zsre", "counterfact", "wiki", "safeedit_train", "safeedit_test"],
+        choices=["zsre", "counterfact", "wiki", "safeedit_train", "safeedit_test","zsre10k"],
     )
     parser.add_argument("--eval_num", type=int, default=200)
     parser.add_argument("--alg_name", required=True, type=str, default="ft_edit")
