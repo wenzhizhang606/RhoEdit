@@ -60,7 +60,7 @@ from easyeditor import (
 def get_arguments():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', required=True, type=str)
-    parser.add_argument('--data_type', required=True, type=str, default='zsre', choices=['zsre', 'counterfact', 'wiki'])
+    parser.add_argument('--data_type', required=True, type=str, default='zsre', choices=['zsre', 'counterfact', 'wiki', 'zsre10k'])
     parser.add_argument('--editing_method', required=True, type=str, choices=['FT', 'MEND', 'ROME', 'R-ROME', 'MEMIT', 'GRACE', 'WISE', 'AlphaEdit', 'IKE', 'MELO', 'LoRA', 'UltraEdit'])
     parser.add_argument('--eval_every', required=True, type=int, default=512, help='Evaluation frequency.')
     parser.add_argument('--sequential_edit', default='True', type=str)
@@ -81,6 +81,35 @@ def get_arguments():
     )
     args = parser.parse_args()
     return args
+
+
+def configure_device_placement(hparams, editing_method):
+    visible_gpus = torch.cuda.device_count()
+    if visible_gpus == 0:
+        raise RuntimeError('No CUDA device is visible. These editing methods require CUDA.')
+
+    use_model_parallel = visible_gpus >= 2
+    primary_device = 0
+
+    hparams.model_parallel = use_model_parallel
+    hparams.device = primary_device
+    if use_model_parallel:
+        # Keep GPU 0 relatively free because editing methods place auxiliary
+        # matrices and optimizer state on the primary device.
+        hparams.device_map = 'balanced_low_0'
+
+    # MEND's hypernetwork adds a sizeable fp32 allocation. Load the base model
+    # in half precision from the start in both single- and multi-GPU modes.
+    if editing_method == 'MEND':
+        hparams.fp16 = True
+
+    mode = 'multi-GPU' if use_model_parallel else 'single-GPU'
+    visible = os.environ.get('CUDA_VISIBLE_DEVICES', '<all>')
+    print(
+        f'Using {mode}: visible={visible}, count={visible_gpus}, '
+        f'primary=cuda:{primary_device}'
+    )
+
 
 def get_hparams_and_editor(args):
     if args.editing_method == 'FT':
@@ -112,31 +141,11 @@ def get_hparams_and_editor(args):
     
     hparams = editing_hparams.from_hparams(f"./hparams/{args.editing_method}/{args.model}")
     hparams.model_name = resolve_local_model_name(hparams.model_name)
-    visible_gpus = torch.cuda.device_count()
-    if args.editing_method == "MEND":
-        # Last-layer einsum stays on one device. Two-GPU split still fills the last 48GB card.
-        # fp16 is read by BaseEditor even if the Llama-MEND bfloat16 branch is missing.
-        hparams.model_parallel = False
-        hparams.device = 0
-        hparams.fp16 = True
-        print("MEND: single GPU, half precision (device 0)")
-    elif visible_gpus == 1:
-        hparams.device = 0
-    elif visible_gpus >= 2:
-        # Scheduler sets CUDA_VISIBLE_DEVICES to two cards; split the model so one GPU does not OOM.
-        hparams.model_parallel = True
-        hparams.device = 0
-        print(f"Using model_parallel across {visible_gpus} GPUs")
+    configure_device_placement(hparams, args.editing_method)
     hparams.batch_size = args.num_edits ### NOTE: We try to match the naming convention in easy edit. batch_size here means the number of edits in a sequential edit.
     hparams.chunk_batch_size = args.batch_size ### NOTE: chunk_batch_size is the actual batch size for fine-tuning in a sequential chunk. Most methods in easyeditor do not use this parameter, so changing this will hardly affect anything.
     assert hparams.chunk_batch_size == 1 or (hparams.chunk_batch_size > 1 and args.editing_method in ['LoRA']), "Currently only LoRA supports batch fine-tuning. Are you sure what you are doing?"
     editor = BaseEditor.from_hparams(hparams)
-    if args.editing_method == "MEND":
-        print(f"MEND loaded dtype={getattr(editor.model, 'dtype', None)}")
-        if getattr(editor.model, "dtype", None) == torch.float32:
-            print("MEND is still fp32 after load; converting to bfloat16")
-            editor.model = editor.model.to(dtype=torch.bfloat16)
-            print(f"MEND converted dtype={editor.model.dtype}")
     return hparams, editor
 
 if __name__ == "__main__":

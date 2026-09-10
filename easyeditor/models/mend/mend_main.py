@@ -37,6 +37,11 @@ class MendRewriteExecutor:
         if param0.dtype == torch.float32:
             # 48GB cards cannot hold Llama-3-8B fp32 + IDMLP[18432]. Convert even if
             # BaseEditor loaded fp32 (old editor.py on the server).
+            if params.model_parallel:
+                raise RuntimeError(
+                    'MEND multi-GPU mode requires the base model to be loaded '
+                    'in half precision. Set hparams.fp16=True before creating BaseEditor.'
+                )
             device = torch.device(f"cuda:{params.device}")
             print("[MEND] converting model fp32 -> bfloat16 via CPU to avoid 48GB OOM")
             self.model = self.model.to("cpu").to(dtype=torch.bfloat16)
@@ -48,7 +53,8 @@ class MendRewriteExecutor:
         self.alg = MEND(self.model, params, lambda: deepcopy(self.model))
         # Hypernetwork must stay fp32. GradientTransform.forward already casts hooked
         # activations to float32; casting mend to bf16 caused BFloat16 != float in IDMLP.
-        self.alg.mend.to(device=param0.device)
+        editor_device = torch.device(f"cuda:{params.device}")
+        self.alg.mend.to(device=editor_device)
         mend0 = next(self.alg.mend.parameters())
         print(
             f"[MEND] model dtype={param0.dtype}, device={param0.device}; "
@@ -110,11 +116,12 @@ class MendRewriteExecutor:
         ]
 
         # Tokenize
+        input_device = self.model.get_input_embeddings().weight.device
         sent_tok = self.tokenizer(sentences, padding=True, return_tensors="pt").to(
-            f"cuda:{hparams.device}"
+            input_device
         )
         target_tok = self.tokenizer(targets, padding=True, return_tensors="pt").to(
-            f"cuda:{hparams.device}"
+            input_device
         )
 
         # Define labels
@@ -293,4 +300,3 @@ class MendPerRewriteExecutor(MendRewriteExecutor):
         edited_model, model_info = self.alg.edit(request["cond"], personality=True, return_factors=True)
         
         return edited_model, weights_copy
-        

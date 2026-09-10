@@ -335,6 +335,17 @@ class MEND(EditableModel):
 
         loss.backward()
 
+        def run_transform(transform, x, delta, param_idx=None):
+            transform_param = next(transform.parameters(), None)
+            transform_device = (
+                transform_param.device if transform_param is not None else x.device
+            )
+            x = x.to(transform_device)
+            delta = delta.to(transform_device)
+            if param_idx is None:
+                return transform(x, delta)
+            return transform(x, delta, param_idx)
+
         if self.config.shared:
             param_idx = (
                 lambda n, p: self.shape_dict[self.get_shape(p)].index(n)
@@ -342,8 +353,11 @@ class MEND(EditableModel):
                 else None
             )  # noqa: E731
             transformed_factors = {
-                n: self.mend[str(tuple(self.get_shape(p)))](
-                    p.__x__, p.__delta__, param_idx(n, p)
+                n: run_transform(
+                    self.mend[str(tuple(self.get_shape(p)))],
+                    p.__x__,
+                    p.__delta__,
+                    param_idx(n, p),
                 )
                 for n, p in _inner_params(
                     self.model.named_parameters(), self.config.inner_params
@@ -351,7 +365,9 @@ class MEND(EditableModel):
             }
         else:
             transformed_factors = {
-                n: self.mend[n.replace(".", "#")](p.__x__, p.__delta__)
+                n: run_transform(
+                    self.mend[n.replace(".", "#")], p.__x__, p.__delta__
+                )
                 for n, p in _inner_params(
                     self.model.named_parameters(), self.config.inner_params
                 )
@@ -373,13 +389,14 @@ class MEND(EditableModel):
             for n, p in _inner_params(
                 self.model.named_parameters(), self.config.inner_params
             ):
+                pseudo_grad = mean_grads[n].to(p.grad.device)
                 info_dict[f"grad/true_mag{idx}"] = p.grad.norm(2).item()
-                info_dict[f"grad/pseudo_mag{idx}"] = mean_grads[n].norm(2).item()
+                info_dict[f"grad/pseudo_mag{idx}"] = pseudo_grad.norm(2).item()
                 info_dict[f"grad/true_std{idx}"] = p.grad.std().item()
-                info_dict[f"grad/pseudo_std{idx}"] = mean_grads[n].std().item()
-                info_dict[f"grad/diff{idx}"] = (p.grad - mean_grads[n]).norm(2).item()
+                info_dict[f"grad/pseudo_std{idx}"] = pseudo_grad.std().item()
+                info_dict[f"grad/diff{idx}"] = (p.grad - pseudo_grad).norm(2).item()
                 info_dict[f"grad/cos{idx}"] = F.cosine_similarity(
-                    p.grad.reshape(-1), mean_grads[n].reshape(-1), dim=0
+                    p.grad.reshape(-1), pseudo_grad.reshape(-1), dim=0
                 ).item()
                 idx += 1
         else:
@@ -400,7 +417,9 @@ class MEND(EditableModel):
         new_params = []
         for n, p in edited_model.named_parameters():
             if n in pset:
-                new_params.append(p + updates[n].to(p.dtype))
+                new_params.append(
+                    p + updates[n].to(device=p.device, dtype=p.dtype)
+                )
             else:
                 new_params.append(p)
 
