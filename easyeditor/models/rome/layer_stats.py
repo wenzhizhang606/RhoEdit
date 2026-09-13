@@ -1357,56 +1357,6 @@ def load_wiki_ds(ds_name):
     raw_ds = raw_ds["train"].train_test_split(test_size=0.001, seed=69, shuffle=True)
     raw_ds['val'] = raw_ds.pop("test")
     return raw_ds
-    '''
-    raw_ds = None
-    if CACHE_DIR:
-        cache_root = Path(CACHE_DIR)
-        # 本地候选目录：兼容多种命名（ds_name 或 dataset_name 的 / 替换为 _）。
-        local_candidates = [
-            cache_root / ds_name,
-            cache_root / dataset_name.replace("/", "_"),
-        ]
-        for candidate in local_candidates:
-            if not candidate.exists():
-                continue
-            # 1) 优先按 save_to_disk 格式加载（之前用 save_to_disk 保存的目录）。
-            try:
-                print(f"[load_wiki_ds] Trying load_from_disk: {candidate}")
-                raw_ds = load_from_disk(str(candidate))
-                print(f"[load_wiki_ds] Loaded via load_from_disk: {candidate}")
-                break
-            except Exception as exc:
-                print(f"[load_wiki_ds] load_from_disk failed for {candidate}: {exc}")
-            # 2) 回退：把目录下所有 parquet 文件作为数据源加载。
-            parquet_files = sorted(candidate.rglob("*.parquet"))
-            if parquet_files:
-                try:
-                    print(f"[load_wiki_ds] Trying parquet files in {candidate} "
-                          f"({len(parquet_files)} files)")
-                    raw_ds = load_dataset(
-                        "parquet",
-                        data_files={"train": [str(p) for p in parquet_files]},
-                        cache_dir=CACHE_DIR,
-                    )
-                    print(f"[load_wiki_ds] Loaded via parquet: {candidate}")
-                    break
-                except Exception as exc:
-                    print(f"[load_wiki_ds] parquet load failed for {candidate}: {exc}")
-
-    if raw_ds is None:
-        print(f"[load_wiki_ds] Local dataset not found; loading "
-              f"{dataset_name}/{config_name} from Hub")
-        raw_ds = load_dataset(
-            dataset_name,
-            config_name,
-            cache_dir=CACHE_DIR,
-            download_mode="reuse_cache_if_exists",
-        )
-
-    raw_ds = raw_ds["train"].train_test_split(test_size=0.001, seed=69, shuffle=True)
-    raw_ds['val'] = raw_ds.pop("test")
-    return raw_ds
-    '''
 
 def get_shuffled_subset_texts(dataset, sample_size, seed=42):
     shuffled_ds = dataset.shuffle(seed=seed)
@@ -1419,13 +1369,14 @@ def load_stats_ds(ds_name):
         return load_wiki_ds(name)
     if name in ("counterfact-edit_3k",):
         return load_counterfact_ds(ds_name)
-    if name in ("zsre", "zsre_mend_163k"):
+    if name in ("zsre_mend_3k", "zsre_mend_10k", "zsre_mend_163k"):
         return load_zsre_ds(ds_name)
     if name in ("wiki_big_edit_3k",):
         return load_wikidemo_ds(ds_name)
     raise ValueError(
         f"Unsupported K-FAC dataset '{ds_name}'. Expected wikipedia, wikitext, "
-        "counterfact, zsre_mend_163k or wikidemo."
+        "counterfact-edit_3k, zsre, zsre_mend_3k, zsre_mend_10k, "
+        "zsre_mend_163k or wiki_big_edit_3k."
     )
 
 

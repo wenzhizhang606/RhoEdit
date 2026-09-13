@@ -105,7 +105,7 @@ def prepare_prompts_from_data_type_safeedit(data_type):
         "safeedit_test": "SafeEdit_test",
     }[data_type]
     data = json.load(open(f"./data/{data_file}.json", 'r', encoding='utf-8'))
-
+    
     prompts = [d['adversarial prompt'] for d in data]
     target_safe = [d['safe generation'] for d in data]
     target_unsafe = [d['unsafe generation'] for d in data]

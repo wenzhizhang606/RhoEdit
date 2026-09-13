@@ -7,7 +7,6 @@ import torch
 import random
 from dotenv import load_dotenv
 from tqdm import trange
-from peft import AdaLoraConfig, LoraConfig, TaskType, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .projected_adam import  ProjectedAdam
@@ -17,11 +16,28 @@ from ..rome.layer_stats import (
     layer_stats_kfac_one_pass,
     layer_stats_kfac_with_txt_tgt,
 )
-from .CrispEdit_hparams import AdamHyperParams
+from .RhoEdit_hparams import AdamHyperParams
 from easyeditor.tools import ExperimentTracker
 
 load_dotenv()
 STATS_DIR = os.getenv("STATS_DIR")
+
+# Only used when loading K-FAC stats. Edit JSON loading stays in the root utils.py.
+KFAC_DATASET_ALIASES = {
+    "zsre": "zsre_mend_3k",
+    "zsre3k": "zsre_mend_3k",
+    "zsre_3k": "zsre_mend_3k",
+    "zsre10k": "zsre_mend_10k",
+    "zsre163k": "zsre_mend_163k",
+    "counterfact": "counterfact-edit_3k",
+    "wiki": "wiki_big_edit_3k",
+}
+
+
+def normalize_kfac_dataset(ds_name):
+    if not ds_name:
+        return ds_name
+    return KFAC_DATASET_ALIASES.get(str(ds_name).lower(), ds_name)
 
 
 def _is_llama_or_phi(model_name: str) -> bool:
@@ -55,8 +71,11 @@ def _build_cov_cache_from_hparams(
     dtype_name = _cache_dtype_name(hparams)
     sample_size = _cache_sample_size(hparams)
 
-    task_mom2_dataset = getattr(hparams, "task_mom2_dataset", None)
+    raw_task_dataset = getattr(hparams, "task_mom2_dataset", None)
+    task_mom2_dataset = normalize_kfac_dataset(raw_task_dataset)
     task_sample_size= getattr(hparams, "task_mom2_n_samples", None)
+    if raw_task_dataset and task_mom2_dataset != raw_task_dataset:
+        print(f"[RhoEdit] K-FAC task dataset {raw_task_dataset} -> {task_mom2_dataset}")
     print("[RhoEdit] Computing/loading base KFAC stats.")
     stats_dict = layer_stats_kfac_one_pass(
         model=model,
@@ -109,8 +128,7 @@ def _to_cpu_float32(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.to("cpu", dtype=torch.float32).contiguous()
 
 
-def calculate_projection_cache_with_kfac(A, B, energy_threshold=0.9):
-    del energy_threshold
+def calculate_projection_cache_with_kfac(A, B):
     return {
         "A": _to_cpu_float32(A),
         "B": _to_cpu_float32(B),
@@ -120,28 +138,21 @@ def calculate_projection_cache_with_kfac(A, B, energy_threshold=0.9):
 def get_weights(
     model: AutoModelForCausalLM,
     hparams: AdamHyperParams,
-    bias: bool,
     to_cpu: bool = False,
 ) -> Dict[str, torch.Tensor]:
-    bias = False
     return {
         n: (p.detach().cpu().clone() if to_cpu else p)
         for n, p in model.named_parameters()
         for layer in hparams.layers
-        if hparams.rewrite_module_tmp.format(layer) in n and (bias or ("bias" not in n))
+        if hparams.rewrite_module_tmp.format(layer) in n and "bias" not in n
     }
 
 
 def calculate_cov_cache_with_old_data(model, tok, hparams, force_recompute=False) -> Dict[str, Dict]:
-    if getattr(hparams, "no_crisp", False):
-        return None
     return _build_cov_cache_from_hparams(model, tok, hparams, force_recompute)
 
 
 def calculate_cov_cache_with_request(txt, tgt, model, tok, hparams):
-    if getattr(hparams, "no_crisp", False):
-        return None
-
     cov_stats_dict = layer_stats_kfac_with_txt_tgt(
         model,
         tok,
@@ -195,12 +206,11 @@ def recalculate_cov_cache_if_weights_changed(
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, Dict], bool]:
     if (
         not getattr(hparams, "recalculate_cache", False)
-        or getattr(hparams, "no_crisp", False)
         or current_weights_cpu is None
     ):
         return current_weights_cpu, layer_to_cov_cache, False
 
-    weights = get_weights(model, hparams, bias=True)
+    weights = get_weights(model, hparams)
     threshold = getattr(hparams, "recalculate_weight_threshold", 0.01)
     if not is_weights_changed(weights, current_weights_cpu, threshold):
         return current_weights_cpu, layer_to_cov_cache, False
@@ -213,7 +223,7 @@ def recalculate_cov_cache_if_weights_changed(
     layer_to_cov_cache = calculate_cov_cache_with_old_data(
         model, tok, hparams, force_recompute=True
     )
-    weights = get_weights(model, hparams, bias=True)
+    weights = get_weights(model, hparams)
     current_weights_cpu = cache_weights_to_cpu(weights)
     return current_weights_cpu, layer_to_cov_cache, True
 
@@ -257,44 +267,27 @@ def build_optimizer_with_cov_caches(
     layer_to_cov_caches: List[Dict[str, Dict]],
     opt=None,
 ):
-    if getattr(hparams, "no_crisp", False) and opt is not None:
+    valid_caches = _valid_cov_caches(layer_to_cov_caches)
+    if valid_caches:
+        combined_layer_to_cov_cache = combine_layer_to_cov_caches(valid_caches)
+        weight_to_projection_cache = calculate_projection_caches_from_cov_caches(
+            model,
+            hparams,
+            combined_layer_to_cov_cache,
+        )
+    else:
+        weight_to_projection_cache = {}
+
+    if opt is not None:
+        opt.reset_cache(weight_to_projection_cache)
         return opt
 
-    weights = get_weights(model, hparams, bias=True)
-    weight_params = [v for _, v in weights.items()]
-
-    if getattr(hparams, "no_crisp", False):
-        return torch.optim.Adam(
-            weight_params,
-            lr=hparams.lr,
-            weight_decay=hparams.weight_decay,
-        )
-
-    valid_caches = _valid_cov_caches(layer_to_cov_caches)
-
-    primary_cov_cache = combine_layer_to_cov_caches([valid_caches[0]])
-
-
-
-    primary_projection_cache = calculate_projection_caches_from_cov_caches(
-        model,
-        hparams,
-        primary_cov_cache
-        )
-
+    weights = get_weights(model, hparams)
     return ProjectedAdam(
-        weight_params,
-        projection_cache_map=primary_projection_cache,
-        soft_lambda=getattr(
-            hparams,
-            "soft_lambda",
-            1.0,
-        ),
-        factor_damping=getattr(
-            hparams,
-            "newton_damping",
-            1e-5,
-        ),
+        [v for _, v in weights.items()],
+        projection_cache_map=weight_to_projection_cache,
+        soft_lambda=getattr(hparams, "soft_lambda", 1.0),
+        factor_damping=getattr(hparams, "newton_damping", 1e-5),
         lr=hparams.lr,
         weight_decay=hparams.weight_decay,
     )
@@ -302,7 +295,6 @@ def build_optimizer_with_cov_caches(
 
 def combine_layer_to_cov_caches(
     layer_to_cov_caches: List[Dict[str, Dict]],
-    normalize_trace_with_first=False,
 ) -> Dict[str, Dict]:
     layer_to_cov_caches = _valid_cov_caches(layer_to_cov_caches)
     if len(layer_to_cov_caches) == 0:
@@ -359,8 +351,25 @@ def combine_layer_to_cov_caches(
                 }
             )
     print(f"Combined samples {num_samples_list}")
-    print(f"\n\n\nlook:{combined_layer_to_cov_caches}\n\n\n")
     return combined_layer_to_cov_caches
+
+
+def attach_task_factors(
+    cap_caches: Optional[Dict[str, Dict]],
+    source_caches: Optional[Dict[str, Dict]],
+) -> Optional[Dict[str, Dict]]:
+    """Copy edit/task K-FAC factors onto a cap cache without blending A/B."""
+    if not cap_caches or not source_caches:
+        return cap_caches
+    for layer_name, cap_cache in cap_caches.items():
+        source = source_caches.get(layer_name)
+        if source is None or "task_A" not in source or "task_B" not in source:
+            continue
+        cap_cache["task_A"] = source["task_A"]
+        cap_cache["task_B"] = source["task_B"]
+        if "task_num_samples" in source:
+            cap_cache["task_num_samples"] = source["task_num_samples"]
+    return cap_caches
 
 
 def _find_weight_for_layer(weights: Dict[str, torch.Tensor], layer_name: str):
@@ -378,12 +387,9 @@ def calculate_projection_caches_from_cov_caches(
     model,
     hparams,
     layer_to_cov_caches,
-    energy_threshold=None,
 ):
-    # 不使用阈值来限制
-    del energy_threshold
     weight_to_projection_cache = {}
-    weights = get_weights(model, hparams, bias=False)
+    weights = get_weights(model, hparams)
     device = _model_device(model)
 
     for layer_name, cov_cache in layer_to_cov_caches.items():
@@ -403,19 +409,15 @@ def calculate_projection_caches_from_cov_caches(
             }
         )
 
-        if "task_A" in cov_cache and "task_B" in cov_cache:
-            task_A = cov_cache["task_A"].to(device=device, dtype=torch.float32)
-            task_B = cov_cache["task_B"].to(device=device, dtype=torch.float32)
-            task_num_samples = cov_cache.get("task_num_samples")
-        else:
-            print(
-                "[CrispEdit-New] Skipping soft K-FAC cache for "
-                f"{layer_name}: missing edit/task K-FAC factors."
+        if "task_A" not in cov_cache or "task_B" not in cov_cache:
+            raise ValueError(
+                f"RhoEdit projection for {layer_name} is missing task_A/task_B. "
+                "Pass the original capability cache, or call attach_task_factors, "
+                "so edit curvature is preserved."
             )
-            del A, B
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            continue
+        task_A = cov_cache["task_A"].to(device=device, dtype=torch.float32)
+        task_B = cov_cache["task_B"].to(device=device, dtype=torch.float32)
+        task_num_samples = cov_cache.get("task_num_samples")
 
         if not _is_llama_or_phi(hparams.model_name):
             task_A, task_B = task_B, task_A
@@ -434,34 +436,7 @@ def calculate_projection_caches_from_cov_caches(
         del A, B, task_A, task_B
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-    print(f"\n\n\nlook:{weight_to_projection_cache}\n\n\n")
     return weight_to_projection_cache
-
-
-def wrap_model_with_lora_and_return_opt(model, hparams):
-    if hparams.lora_type == "lora":
-        lora_config = LoraConfig
-    elif hparams.lora_type == "adalora":
-        lora_config = AdaLoraConfig
-    else:
-        raise ValueError(f"Unsupported lora_type: {hparams.lora_type}")
-
-    peft_config = lora_config(
-        task_type=TaskType.CAUSAL_LM,
-        inference_mode=False,
-        r=hparams.lora_rank,
-        lora_alpha=hparams.lora_alpha,
-        lora_dropout=hparams.lora_dropout,
-        layers_to_transform=hparams.layers if len(hparams.layers) > 0 else None,
-        target_modules=hparams.target_modules,
-    )
-    peft_model = get_peft_model(model, peft_config)
-    opt = torch.optim.Adam(
-        peft_model.parameters(),
-        lr=hparams.lr,
-        weight_decay=hparams.weight_decay,
-    )
-    return peft_model, opt
 
 
 def update_model_and_tokenizer_with_appropriate_padding_token(model, tokenizer, hparams):
@@ -473,6 +448,22 @@ def update_model_and_tokenizer_with_appropriate_padding_token(model, tokenizer, 
         model.resize_token_embeddings(len(tokenizer), mean_resizing=False)
         model.config.pad_token_id = tokenizer.pad_token_id
     return model, tokenizer
+
+
+def setup_requests_for_safeedit(requests: List[Dict]) -> List[Dict]:
+    """Adapt SafeEdit records to the prompt/target format used by RhoEdit."""
+    if not requests:
+        return []
+    if "target_new" in requests[0]:
+        return requests
+
+    return [
+        {
+            "prompt": request["question"],
+            "target_new": request["target_unsafe"],
+        }
+        for request in requests
+    ]
 
 def chunks(arr, n):
     """Yield successive n-sized chunks from arr."""
@@ -508,9 +499,6 @@ def execute_sft_adam(
     hparams: AdamHyperParams,
     **kwargs: Any,
 ) -> AutoModelForCausalLM:
-    """
-    Executes the FT update algorithm for the specified update at the specified layer
-    """
     print("[execute_sft_adam]Enter the function")
     device = model.device
     if tok.padding_side != "right":
@@ -525,18 +513,14 @@ def execute_sft_adam(
         model, tok, hparams, force_recompute=False
     )
     
-    if hparams.perform_lora:
-        model, opt = wrap_model_with_lora_and_return_opt(model, hparams)
-        current_weights_cpu = None #my code gets uglier with each day
-    else:
-        opt = build_optimizer_with_cov_caches(model, hparams, [layer_to_cov_cache_old])
-        weights = get_weights(model, hparams, bias=True)
-        current_weights_cpu = cache_weights_to_cpu(weights)
-        for name, w in model.named_parameters():
-            w.requires_grad = name in weights
-    # 加快训练，省略old_loss计算
-    #old_loss = calculate_old_loss(model, tok, hparams)
-    #ExperimentTracker.log(old_loss) # fine to log even if empty, basically no-op
+    opt = build_optimizer_with_cov_caches(model, hparams, [layer_to_cov_cache_old])
+    weights = get_weights(model, hparams)
+    current_weights_cpu = cache_weights_to_cpu(weights)
+    for name, w in model.named_parameters():
+        w.requires_grad = name in weights
+
+    old_loss = calculate_old_loss(model, tok, hparams)
+    ExperimentTracker.log(old_loss)
     loss_meter = AverageMeter()
     pbar = trange(hparams.num_steps)
     print("[execute_sft_adam]Start training\n")
@@ -576,20 +560,15 @@ def execute_sft_adam(
                 )
                 if should_recalculate:
                     opt = build_optimizer_with_cov_caches(model, hparams, [layer_to_cov_cache_old], opt=opt)
-        # 加快训练，省略old_loss计算
-        #metrics =calculate_old_loss(model, tok, hparams)
-        #metrics.update({"FT Loss": loss_meter.avg})
-        metrics = {"FT Loss": loss_meter.avg}
-        ExperimentTracker.log(metrics) # fine to log even if empty, basically no-op
+        metrics =calculate_old_loss(model, tok, hparams)
+        metrics.update({"FT Loss": loss_meter.avg})
+        ExperimentTracker.log(metrics)
         
         pbar.write(f"FT Loss: {loss_meter.avg:.4f}")
         pbar.set_postfix({"loss": f"{loss_meter.avg:.4f}"})
 
         if loss_meter.avg < 1e-2:
             break
-    
-    if hparams.perform_lora:
-        model = model.merge_and_unload()
     
     return model
 
@@ -599,10 +578,7 @@ def execute_sft_adam_sequential(
     requests: List[Dict],
     hparams: AdamHyperParams,
     **kwargs: Any,
-    ) -> AutoModelForCausalLM:
-    """
-    Executes the FT update algorithm for the specified update at the specified layer
-    """
+) -> AutoModelForCausalLM:
     device = model.device
     
     if tok.padding_side != "right":
@@ -610,7 +586,7 @@ def execute_sft_adam_sequential(
     
     requests = deepcopy(requests)
     for i, request in enumerate(requests):
-        if request["target_new"][0] != " ":
+        if request["target_new"] and request["target_new"][0] != " ":
             requests[i]["target_new"] = " " + request["target_new"]
     random.shuffle(requests)
     texts = [r["prompt"] for r in requests]
@@ -623,19 +599,16 @@ def execute_sft_adam_sequential(
     )
 
     
-    if hparams.perform_lora:
-        model, opt = wrap_model_with_lora_and_return_opt(model, hparams)
-        current_weights_cpu = None #my code gets uglier with each day
-    else:
-        opt = build_optimizer_with_cov_caches(model, hparams, [layer_to_cov_cache_old])
-        weights = get_weights(model, hparams, bias=True)
-        current_weights_cpu = cache_weights_to_cpu(weights)
+
+    opt = build_optimizer_with_cov_caches(model, hparams, [layer_to_cov_cache_old])
+    weights = get_weights(model, hparams)
+    current_weights_cpu = cache_weights_to_cpu(weights)
         
-        for name, w in model.named_parameters():
-            w.requires_grad = name in weights
+    for name, w in model.named_parameters():
+        w.requires_grad = name in weights
 
     old_loss = calculate_old_loss(model, tok, hparams)
-    wandb.log(old_loss) # fine to log even if empty, basically no-op
+    ExperimentTracker.log(old_loss)
     
     layer_to_cov_cache_data = None
     loss_meter = AverageMeter()
@@ -651,13 +624,26 @@ def execute_sft_adam_sequential(
                 chunks(txt_edit, hparams.batch_size), chunks(tgt_edit, hparams.batch_size)
             ):
                 inputs_targets = [txt_ + tgt_ for txt_, tgt_ in zip(txt, tgt)]
-                encodings = tok(inputs_targets, return_tensors="pt", padding=True).to(device)
+                encodings = tok(
+                    inputs_targets,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=hparams.max_length,
+                ).to(device)
 
                 labels = encodings["input_ids"].clone()
 
                 labels[labels == tok.pad_token_id] = -100
                 for i, prompt in enumerate(txt):
-                    prompt_len = len(tok(prompt, add_special_tokens=True)["input_ids"])
+                    prompt_len = len(
+                        tok(
+                            prompt,
+                            add_special_tokens=True,
+                            truncation=True,
+                            max_length=hparams.max_length,
+                        )["input_ids"]
+                    )
                     labels[i, :prompt_len] = -100
                 opt.zero_grad()
                 outputs = model(**encodings, labels=labels)
@@ -708,28 +694,34 @@ def execute_sft_adam_sequential(
             if layer_to_cov_cache_data is None:
                 layer_to_cov_cache_data = layer_to_cov_cache_data_new
             else:
-                layer_to_cov_cache_data = combine_layer_to_cov_caches([layer_to_cov_cache_data, layer_to_cov_cache_data_new], normalize_trace_with_first=True)
+                layer_to_cov_cache_data = combine_layer_to_cov_caches([layer_to_cov_cache_data, layer_to_cov_cache_data_new])
             opt = build_optimizer_with_cov_caches(model, hparams, [layer_to_cov_cache_old, layer_to_cov_cache_data], opt=opt)
 
         elif hparams.edit_cache_style == 'mix':
             old_txt_list = [item for sublist in txt_chunks for item in sublist]
             old_tgt_list = [item for sublist in tgt_chunks for item in sublist]
 
-            layer_to_cov_cache_data_pretrain_mix = calculate_cov_cache_with_request(
-                old_txt_list,
-                old_tgt_list,
-                model,
-                tok,
-                hparams,
+            layer_to_cov_cache_data_pretrain_mix = attach_task_factors(
+                calculate_cov_cache_with_request(
+                    old_txt_list,
+                    old_tgt_list,
+                    model,
+                    tok,
+                    hparams,
+                ),
+                layer_to_cov_cache_old,
             )
 
-            opt = build_optimizer_with_cov_caches(model, hparams, [layer_to_cov_cache_data_pretrain_mix], opt=opt)
+            opt = build_optimizer_with_cov_caches(
+                model, hparams, [layer_to_cov_cache_data_pretrain_mix], opt=opt
+            )
+        elif hparams.edit_cache_style == "disable":
+            print("[RhoEdit] edit_cache_style=disable; projection cache not updated.")
 
         metrics = calculate_old_loss(model, tok, hparams)
         old_edit_loss = calculate_old_edit_loss(txt_chunks, tgt_chunks, model, tok)
         metrics.update(old_edit_loss)
-        wandb.log(metrics) # fine to log even if empty, basically no-op
+        metrics.update({"FT Loss": loss_meter.avg})
+        ExperimentTracker.log(metrics)
 
-    if hparams.perform_lora:
-        model = model.merge_and_unload()
     return model
