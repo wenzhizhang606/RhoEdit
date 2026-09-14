@@ -1,4 +1,7 @@
 import os
+import re
+from typing import Any, Dict, Optional
+
 from dotenv import load_dotenv, find_dotenv
 
 try:
@@ -10,6 +13,59 @@ try:
     import swanlab
 except ImportError:
     swanlab = None
+
+
+def _sanitize_metric_key(key: Any) -> str:
+    text = str(key).strip()
+    text = text.replace(" ", "_")
+    text = re.sub(r"[^0-9A-Za-z_./-]+", "_", text)
+    text = re.sub(r"_+", "_", text).strip("_")
+    return text or "metric"
+
+
+def _to_scalar(value: Any) -> Optional[Any]:
+    if value is None:
+        return None
+    if hasattr(value, "detach"):
+        value = value.detach()
+    if hasattr(value, "cpu"):
+        value = value.cpu()
+    if hasattr(value, "item") and getattr(value, "ndim", 0) == 0:
+        try:
+            value = value.item()
+        except (ValueError, RuntimeError, TypeError):
+            return None
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return float(value) if isinstance(value, float) else int(value)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def sanitize_metrics(metrics: Any, prefix: str = "") -> Dict[str, Any]:
+    """Flatten nested dicts and coerce values to SwanLab/wandb scalars."""
+    if not isinstance(metrics, dict):
+        scalar = _to_scalar(metrics)
+        if scalar is None:
+            return {}
+        return {_sanitize_metric_key(prefix or "metric"): scalar}
+
+    out = {}
+    for raw_key, raw_value in metrics.items():
+        key = _sanitize_metric_key(raw_key)
+        if prefix:
+            key = f"{prefix}/{key}" if key else prefix
+        if isinstance(raw_value, dict):
+            out.update(sanitize_metrics(raw_value, prefix=key))
+            continue
+        scalar = _to_scalar(raw_value)
+        if scalar is None:
+            continue
+        out[key] = scalar
+    return out
 
 
 class ExperimentTracker:
@@ -95,10 +151,13 @@ class ExperimentTracker:
         """记录指标。"""
         if not cls._mode:
             return
+        payload = sanitize_metrics(metrics)
+        if not payload:
+            return
         if cls._use_wandb:
-            wandb.log(metrics, step=step)
+            wandb.log(payload, step=step)
         elif cls._use_swanlab:
-            swanlab.log(metrics, step=step)
+            swanlab.log(payload, step=step)
 
     @classmethod
     def finish(cls):

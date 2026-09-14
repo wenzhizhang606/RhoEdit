@@ -1327,23 +1327,32 @@ def load_wiki_ds(ds_name):
     raw_ds = None
     if CACHE_DIR:
         cache_root = Path(CACHE_DIR)
-        local_candidates = [
-            cache_root / ds_name,
-        ]
-        for candidate in local_candidates:
-            if not candidate.exists():
-                continue
-            try:
-                print(f"[load_wiki_ds] Loading local dataset script from {candidate}")
-                raw_ds = load_dataset(
+        saved_dir = cache_root / ds_name / config_name
+        if (saved_dir / "dataset_info.json").exists() or (saved_dir / "dataset_dict.json").exists():
+            print(f"[load_wiki_ds] Loading saved dataset from {saved_dir}")
+            raw_ds = load_from_disk(str(saved_dir))
+        else:
+            local_candidates = [
+                cache_root / ds_name,
+                cache_root / dataset_name,
+            ]
+            for candidate in local_candidates:
+                if not candidate.exists():
+                    continue
+                try:
+                    print(
+                        f"[load_wiki_ds] Loading local dataset from {candidate} "
+                        f"config={config_name}"
+                    )
+                    raw_ds = load_dataset(
                         str(candidate),
-                        #config_name,
+                        config_name,
                         trust_remote_code=True,
                         cache_dir=CACHE_DIR,
                     )
-                break
-            except Exception as exc:
-                print(f"[load_wiki_ds] Skipping local candidate {candidate}: {exc}")
+                    break
+                except Exception as exc:
+                    print(f"[load_wiki_ds] Skipping local candidate {candidate}: {exc}")
 
     if raw_ds is None:
         print(f"[load_wiki_ds] Local dataset not found; loading {dataset_name}/{config_name}")
