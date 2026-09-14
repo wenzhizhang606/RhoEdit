@@ -1,7 +1,7 @@
 alg_name: "AlphaEdit"
 model_name: "Qwen/Qwen2.5-7B-Instruct"
-stats_dir: "./data/stats"
-P_loc: "./null_space_project.pt"
+stats_dir: "/data1/zwz/ehoedit_stats/"
+P_loc: "/data1/zwz/ehoedit_stats/Qwen2.5-7B-Instruct/null_space_project.pt"
 device: 0
 layers: [4, 5, 6, 7, 8]
 clamp_norm_factor: 4

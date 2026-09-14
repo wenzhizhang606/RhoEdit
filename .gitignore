@@ -39,3 +39,4 @@ experiments/_common_curvature.py
 experiments/run_experiment2_soft_vs_hard.py
 easyeditor/evaluate.needcheck/
 logs_error/
+20260908_table1-easyeditor-baselines-qwen2.5-7b.sh

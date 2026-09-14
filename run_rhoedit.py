@@ -150,7 +150,7 @@ def get_hparams(args):
 def calculate_model_name(args, hparams):
     name = (f"{args.model}_rhoedit_adam_{args.data_type}"
                         f"_{hparams.task_mom2_dataset}"
-                        f"_{hparams.newton_damping}_{hparams.soft_lambda}_{hparams.lr}")
+                        f"_{hparams.newton_damping}_{hparams.soft_lambda}_{hparams.lr}_12_19")
 
     if args.sequential_edit:
         name += f"_sequential_{args.num_edits}"
@@ -197,12 +197,12 @@ if __name__ == "__main__":
     )
 
     device_map = {
-        "model.embed_tokens": 0,
-        "model.rotary_emb": 0,
+        "model.embed_tokens": 1,
+        "model.rotary_emb": 1,
     }
 
     for layer in range(config.num_hidden_layers):
-        device_map[f"model.layers.{layer}"] = 0 if  15 <= layer <= 19 else 1
+        device_map[f"model.layers.{layer}"] = 0 if  12 <= layer <= 19 else 1
 
     device_map["model.norm"] = 1
     device_map["lm_head"] = 1

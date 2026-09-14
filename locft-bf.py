@@ -82,7 +82,7 @@ def execute_ft(
 
     for name, w in model.named_parameters():
         w.requires_grad = name in weights
-    
+
     old_task_loss = calculate_cache_loss(
                 model,
                 tok,
@@ -90,7 +90,6 @@ def execute_ft(
                 sample_size=100
     )
     wandb.log({"Task 1 Loss": old_task_loss})
-
     loss_meter = AverageMeter()
     for it in trange(hparams.num_steps):
         loss_meter.reset()
@@ -134,7 +133,6 @@ def execute_ft(
             if loss.item() >= 1e-2:
                 loss.backward()
                 opt.step()
-
         old_task_loss = calculate_cache_loss(
             model,
             tok,
@@ -142,7 +140,6 @@ def execute_ft(
             sample_size=100
         )
         wandb.log({f"FT Loss": loss_meter.avg, "Task 1 Loss": old_task_loss})
-
         if loss_meter.avg < 1e-2:
             break
     
