@@ -80,12 +80,22 @@ class ProjectedAdam(Adam):
             if projected is not None:
                 exp_avg.copy_(projected)
 
+    # Qwen2.5-7B down_proj input dim is 18944; GPU eigh of that fp64
+    # factor asks for ~8 GiB extra workspace and OOMs next to the model.
+    _CPU_FACTOR_DIM = 8192
+
     @staticmethod
     def _tensor(cache: Dict, key: str, like: torch.Tensor, dtype: torch.dtype):
         value = cache.get(key, None)
         if value is None:
             return None
         return value.to(device=like.device, dtype=dtype)
+
+    @classmethod
+    def _factor_work_device(cls, tensor: torch.Tensor) -> torch.device:
+        if max(tensor.shape) >= cls._CPU_FACTOR_DIM:
+            return torch.device("cpu")
+        return tensor.device
 
     @staticmethod
     def _symmetrize(matrix: torch.Tensor) -> torch.Tensor:

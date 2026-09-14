@@ -152,7 +152,19 @@ def calculate_cov_cache_with_old_data(model, tok, hparams, force_recompute=False
     return _build_cov_cache_from_hparams(model, tok, hparams, force_recompute)
 
 
-def calculate_cov_cache_with_request(txt, tgt, model, tok, hparams):
+def calculate_cov_cache_with_request(
+    txt,
+    tgt,
+    model,
+    tok,
+    hparams,
+    add_pretrain_data: Optional[bool] = None,
+    sample_size: Optional[int] = None,
+):
+    if add_pretrain_data is None:
+        add_pretrain_data = getattr(hparams, "edit_cache_style", "new") == "mix"
+    if sample_size is None:
+        sample_size = getattr(hparams, "edit_n_samples", 10)
     cov_stats_dict = layer_stats_kfac_with_txt_tgt(
         model,
         tok,
@@ -160,9 +172,9 @@ def calculate_cov_cache_with_request(txt, tgt, model, tok, hparams):
         txt=txt,
         tgt=tgt,
         precision=hparams.mom2_dtype,
-        sample_size=getattr(hparams, "edit_n_samples", 10),
+        sample_size=sample_size,
         to_collect=["mom2"],
-        add_pretrain_data=(getattr(hparams, "edit_cache_style", "new") == "mix"),
+        add_pretrain_data=add_pretrain_data,
         pretrain_sample_size=hparams.mom2_n_samples,
     )
 
@@ -370,6 +382,66 @@ def attach_task_factors(
         if "task_num_samples" in source:
             cap_cache["task_num_samples"] = source["task_num_samples"]
     return cap_caches
+
+
+def _strip_task_factors(caches: Optional[Dict[str, Dict]]) -> Dict[str, Dict]:
+    """Keep only retention-side A/B and the sample count."""
+    if not caches:
+        return {}
+    stripped = {}
+    for layer_name, cache in caches.items():
+        stripped[layer_name] = {
+            "A": cache["A"],
+            "B": cache["B"],
+            "num_samples": max(int(cache.get("num_samples", 0)), 1),
+        }
+    return stripped
+
+
+def estimate_chunk_kfac(txt, tgt, model, tok, hparams) -> Dict[str, Dict]:
+    """Estimate K-FAC on the current edit chunk only. No wiki mix, no subsample."""
+    return calculate_cov_cache_with_request(
+        txt,
+        tgt,
+        model,
+        tok,
+        hparams,
+        add_pretrain_data=False,
+        sample_size=len(txt),
+    )
+
+
+def pair_retention_with_edit(
+    retention: Dict[str, Dict],
+    edit_cache: Dict[str, Dict],
+) -> Dict[str, Dict]:
+    """Pair retention-side (A, B) with current-chunk edit-side (task_A, task_B)."""
+    paired = {}
+    for layer_name, ret in retention.items():
+        edit = edit_cache[layer_name]
+        paired[layer_name] = {
+            "A": ret["A"],
+            "B": ret["B"],
+            "num_samples": max(int(ret.get("num_samples", 0)), 1),
+            "task_A": edit["A"],
+            "task_B": edit["B"],
+            "task_num_samples": max(int(edit.get("num_samples", 0)), 1),
+        }
+    return paired
+
+
+def update_retention_eq13(
+    retention: Dict[str, Dict],
+    new_chunk_cache: Dict[str, Dict],
+) -> Dict[str, Dict]:
+    """Sample-weighted retention update: M_k = M_{k-1} + T_k, then mix A/B."""
+    return _strip_task_factors(combine_layer_to_cov_caches([retention, new_chunk_cache]))
+
+
+def _retention_sample_count(retention: Dict[str, Dict]) -> int:
+    if not retention:
+        return 0
+    return max(int(next(iter(retention.values())).get("num_samples", 0)), 0)
 
 
 def _find_weight_for_layer(weights: Dict[str, torch.Tensor], layer_name: str):
@@ -580,6 +652,7 @@ def execute_sft_adam_sequential(
     **kwargs: Any,
 ) -> AutoModelForCausalLM:
     device = model.device
+    cache_style = getattr(hparams, "edit_cache_style", "mix")
     
     if tok.padding_side != "right":
         tok.padding_side = "right"
@@ -597,10 +670,19 @@ def execute_sft_adam_sequential(
     layer_to_cov_cache_old = calculate_cov_cache_with_old_data(
         model, tok, hparams, force_recompute=False
     )
+    # Algorithm 1: retention starts from capability factors only.
+    retention = _strip_task_factors(layer_to_cov_cache_old)
 
-    
-
-    opt = build_optimizer_with_cov_caches(model, hparams, [layer_to_cov_cache_old])
+    # mix/disable still train the first chunk with the startup wiki+task pair.
+    # sequential waits until the current-chunk edit factors are estimated.
+    if cache_style == "sequential":
+        print(
+            "[RhoEdit] edit_cache_style=sequential uses Algorithm 1 "
+            f"(online retention, M_0={_retention_sample_count(retention)})."
+        )
+        opt = None
+    else:
+        opt = build_optimizer_with_cov_caches(model, hparams, [layer_to_cov_cache_old])
     weights = get_weights(model, hparams)
     current_weights_cpu = cache_weights_to_cpu(weights)
         
@@ -617,6 +699,15 @@ def execute_sft_adam_sequential(
     for txt_edit, tgt_edit in zip(
         chunks(texts, hparams.num_edits), chunks(targets, hparams.num_edits)
     ):
+        if cache_style == "sequential":
+            print(
+                f"[RhoEdit] Estimate edit-side K-FAC on {len(txt_edit)} "
+                "current-chunk samples at theta_{k-1}."
+            )
+            edit_cache = estimate_chunk_kfac(txt_edit, tgt_edit, model, tok, hparams)
+            paired = pair_retention_with_edit(retention, edit_cache)
+            opt = build_optimizer_with_cov_caches(model, hparams, [paired], opt=opt)
+
         pbar = trange(hparams.num_steps)
         for it in pbar:
             loss_meter.reset()
@@ -652,13 +743,17 @@ def execute_sft_adam_sequential(
                 if loss.item() >= 1e-2:
                     loss.backward()
                     opt.step()
-                    current_weights_cpu, layer_to_cov_cache_old, should_recalculate = recalculate_cov_cache_if_weights_changed(
-                        model,
-                        tok,
-                        hparams,
-                        current_weights_cpu,
-                        layer_to_cov_cache_old,
-                    )
+                    # Algorithm 1 does not recompute wiki/task caches mid-round.
+                    if cache_style == "sequential":
+                        should_recalculate = False
+                    else:
+                        current_weights_cpu, layer_to_cov_cache_old, should_recalculate = recalculate_cov_cache_if_weights_changed(
+                            model,
+                            tok,
+                            hparams,
+                            current_weights_cpu,
+                            layer_to_cov_cache_old,
+                        )
                     if should_recalculate:                            
                         if hparams.edit_n_samples > 0 and len(txt_chunks) > 0:
                             old_txt_list = [item for sublist in txt_chunks for item in sublist]
@@ -683,21 +778,16 @@ def execute_sft_adam_sequential(
         txt_chunks.append(txt_edit)
         tgt_chunks.append(tgt_edit)
         
-        if hparams.edit_cache_style == 'sequential':
-            layer_to_cov_cache_data_new = calculate_cov_cache_with_request(
-                txt_edit,
-                tgt_edit,
-                model,
-                tok,
-                hparams,
+        if cache_style == "sequential":
+            print(
+                f"[RhoEdit] Re-estimate current-chunk K-FAC at theta_k "
+                f"({len(txt_edit)} samples) and update retention."
             )
-            if layer_to_cov_cache_data is None:
-                layer_to_cov_cache_data = layer_to_cov_cache_data_new
-            else:
-                layer_to_cov_cache_data = combine_layer_to_cov_caches([layer_to_cov_cache_data, layer_to_cov_cache_data_new])
-            opt = build_optimizer_with_cov_caches(model, hparams, [layer_to_cov_cache_old, layer_to_cov_cache_data], opt=opt)
+            post_cache = estimate_chunk_kfac(txt_edit, tgt_edit, model, tok, hparams)
+            retention = update_retention_eq13(retention, post_cache)
+            print(f"[RhoEdit] Retention M_k={_retention_sample_count(retention)}.")
 
-        elif hparams.edit_cache_style == 'mix':
+        elif cache_style == "mix":
             old_txt_list = [item for sublist in txt_chunks for item in sublist]
             old_tgt_list = [item for sublist in tgt_chunks for item in sublist]
 
@@ -715,7 +805,7 @@ def execute_sft_adam_sequential(
             opt = build_optimizer_with_cov_caches(
                 model, hparams, [layer_to_cov_cache_data_pretrain_mix], opt=opt
             )
-        elif hparams.edit_cache_style == "disable":
+        elif cache_style == "disable":
             print("[RhoEdit] edit_cache_style=disable; projection cache not updated.")
 
         metrics = calculate_old_loss(model, tok, hparams)
