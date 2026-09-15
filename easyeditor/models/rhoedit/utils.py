@@ -17,6 +17,7 @@ from ..rome.layer_stats import (
     layer_stats_kfac_with_txt_tgt,
 )
 from .RhoEdit_hparams import AdamHyperParams
+from .seq_tracker import CAP_LOSS_KEY, cov_cache_nbytes
 from easyeditor.tools import ExperimentTracker
 
 load_dotenv()
@@ -434,7 +435,11 @@ def update_retention_eq13(
     retention: Dict[str, Dict],
     new_chunk_cache: Dict[str, Dict],
 ) -> Dict[str, Dict]:
-    """Sample-weighted retention update: M_k = M_{k-1} + T_k, then mix A/B."""
+    """Token-weighted retention update: mix cap A/B with this round's edit A/B.
+
+    Uses the same edit-side factors that preconditioned the round (estimated at
+    theta_{k-1}), not a post-step re-estimate.
+    """
     return _strip_task_factors(combine_layer_to_cov_caches([retention, new_chunk_cache]))
 
 
@@ -649,8 +654,11 @@ def execute_sft_adam_sequential(
     tok: AutoTokenizer,
     requests: List[Dict],
     hparams: AdamHyperParams,
+    tracker=None,
     **kwargs: Any,
 ) -> AutoModelForCausalLM:
+    """Sequential RhoEdit. ``tracker`` (SequentialEditTracker) is optional and
+    only adds per-round evaluation/plotting; the edit path is unchanged."""
     device = model.device
     cache_style = getattr(hparams, "edit_cache_style", "mix")
     
@@ -664,7 +672,9 @@ def execute_sft_adam_sequential(
     random.shuffle(requests)
     texts = [r["prompt"] for r in requests]
     targets = [r["target_new"] for r in requests]
-    txt_chunks, tgt_chunks = [], []
+    rephrases = [r.get("rephrase_prompt") for r in requests]
+    txt_chunks, tgt_chunks, reph_chunks = [], [], []
+    num_rounds = -(-len(texts) // hparams.num_edits)
 
 
     layer_to_cov_cache_old = calculate_cov_cache_with_old_data(
@@ -691,14 +701,20 @@ def execute_sft_adam_sequential(
 
     old_loss = calculate_old_loss(model, tok, hparams)
     ExperimentTracker.log(old_loss)
+    if tracker is not None:
+        tracker.set_baseline(old_loss.get(CAP_LOSS_KEY), num_rounds)
     
     layer_to_cov_cache_data = None
     loss_meter = AverageMeter()
 
     # split into batches
-    for txt_edit, tgt_edit in zip(
-        chunks(texts, hparams.num_edits), chunks(targets, hparams.num_edits)
-    ):
+    for round_idx, (txt_edit, tgt_edit, reph_edit) in enumerate(zip(
+        chunks(texts, hparams.num_edits),
+        chunks(targets, hparams.num_edits),
+        chunks(rephrases, hparams.num_edits),
+    )):
+        if tracker is not None:
+            tracker.begin_round(round_idx)
         if cache_style == "sequential":
             print(
                 f"[RhoEdit] Estimate edit-side K-FAC on {len(txt_edit)} "
@@ -777,15 +793,18 @@ def execute_sft_adam_sequential(
         
         txt_chunks.append(txt_edit)
         tgt_chunks.append(tgt_edit)
+        reph_chunks.append(reph_edit)
+        # Editor state reported by the tracker (K-FAC factors kept across rounds).
+        state_ref = layer_to_cov_cache_old
         
         if cache_style == "sequential":
             print(
-                f"[RhoEdit] Re-estimate current-chunk K-FAC at theta_k "
-                f"({len(txt_edit)} samples) and update retention."
+                f"[RhoEdit] Fold this round's edit K-FAC "
+                f"({len(txt_edit)} samples, estimated at theta_{{k-1}}) into cap."
             )
-            post_cache = estimate_chunk_kfac(txt_edit, tgt_edit, model, tok, hparams)
-            retention = update_retention_eq13(retention, post_cache)
+            retention = update_retention_eq13(retention, edit_cache)
             print(f"[RhoEdit] Retention M_k={_retention_sample_count(retention)}.")
+            state_ref = retention
 
         elif cache_style == "mix":
             old_txt_list = [item for sublist in txt_chunks for item in sublist]
@@ -805,6 +824,7 @@ def execute_sft_adam_sequential(
             opt = build_optimizer_with_cov_caches(
                 model, hparams, [layer_to_cov_cache_data_pretrain_mix], opt=opt
             )
+            state_ref = layer_to_cov_cache_data_pretrain_mix
         elif cache_style == "disable":
             print("[RhoEdit] edit_cache_style=disable; projection cache not updated.")
 
@@ -813,5 +833,21 @@ def execute_sft_adam_sequential(
         metrics.update(old_edit_loss)
         metrics.update({"FT Loss": loss_meter.avg})
         ExperimentTracker.log(metrics)
+
+        if tracker is not None:
+            tracker.end_round(
+                round_idx,
+                model,
+                tok,
+                txt_chunks,
+                tgt_chunks,
+                reph_chunks,
+                state_bytes=cov_cache_nbytes(state_ref),
+                cap_loss=metrics.get(CAP_LOSS_KEY),
+                ft_loss=loss_meter.avg,
+            )
+
+    if tracker is not None:
+        tracker.finalize()
 
     return model

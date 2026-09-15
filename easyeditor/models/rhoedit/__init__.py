@@ -5,3 +5,9 @@ from .utils import (
     update_model_and_tokenizer_with_appropriate_padding_token,
 )
 from .RhoEdit_hparams import AdamHyperParams
+from .seq_tracker import (
+    SequentialEditTracker,
+    plot_final_round_comparison,
+    plot_retention_heatmap,
+    plot_round_curves,
+)

@@ -33,6 +33,8 @@ python run_rhoedit.py --model qwen2.5-7b --data_type zsre \
   --sequential_edit --num_edits 100 --edit_cache_style mix
 ```
 
+顺序编辑的实验图表（默认关闭）：加 `--seq_plot_every N` 后每 N 轮在当前及所有历史 chunk 上评估（teacher-forced token 准确率、paraphrase 泛化、wiki loss 漂移、累计编辑时间、峰值显存、编辑器状态大小），结束时输出到 `./logs/<run-id>/sequential/`：`fig2a_retention_heatmap.png`、`table8_round_curves.png`、`sequential_metrics.json`、`summary.json`。跨方法的 Fig.2b 用 `python plot_sequential.py --compare <run-A>/summary.json <run-B>/summary.json --labels A B`。
+
 常用覆盖：`--lr`、`--newton_damping`、`--soft_lambda`（不传则用 YAML）。模型保存到 `${HF_CACHE_DIR}<run-id>/`。
 
 ## 评测
