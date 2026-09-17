@@ -385,20 +385,6 @@ def attach_task_factors(
     return cap_caches
 
 
-def _strip_task_factors(caches: Optional[Dict[str, Dict]]) -> Dict[str, Dict]:
-    """Keep only retention-side A/B and the sample count."""
-    if not caches:
-        return {}
-    stripped = {}
-    for layer_name, cache in caches.items():
-        stripped[layer_name] = {
-            "A": cache["A"],
-            "B": cache["B"],
-            "num_samples": max(int(cache.get("num_samples", 0)), 1),
-        }
-    return stripped
-
-
 def estimate_chunk_kfac(txt, tgt, model, tok, hparams) -> Dict[str, Dict]:
     """Estimate K-FAC on the current edit chunk only. No wiki mix, no subsample."""
     return calculate_cov_cache_with_request(
@@ -410,6 +396,19 @@ def estimate_chunk_kfac(txt, tgt, model, tok, hparams) -> Dict[str, Dict]:
         add_pretrain_data=False,
         sample_size=len(txt),
     )
+
+
+def _with_sample_count(caches: Dict[str, Dict], n: int) -> Dict[str, Dict]:
+    """Copy A/B and set the Algorithm-1 mix weight (M or T), dropping task factors."""
+    n = max(int(n), 1)
+    return {
+        layer_name: {
+            "A": cache["A"],
+            "B": cache["B"],
+            "num_samples": n,
+        }
+        for layer_name, cache in caches.items()
+    }
 
 
 def pair_retention_with_edit(
@@ -434,13 +433,16 @@ def pair_retention_with_edit(
 def update_retention_eq13(
     retention: Dict[str, Dict],
     new_chunk_cache: Dict[str, Dict],
+    t_k: int,
 ) -> Dict[str, Dict]:
-    """Token-weighted retention update: mix cap A/B with this round's edit A/B.
+    """Algorithm 1 sample-weighted mix of post-update edit factors into retention.
 
-    Uses the same edit-side factors that preconditioned the round (estimated at
-    theta_{k-1}), not a post-step re-estimate.
+    M_k = M_{k-1} + T_k
+    A_bar_k = (M_{k-1} A_bar_{k-1} + T_k A_k) / M_k
+    where T_k = |D_edit^{(k)}| and (A_k, B_k) are estimated on theta_k.
     """
-    return _strip_task_factors(combine_layer_to_cov_caches([retention, new_chunk_cache]))
+    incoming = _with_sample_count(new_chunk_cache, t_k)
+    return combine_layer_to_cov_caches([retention, incoming])
 
 
 def _retention_sample_count(retention: Dict[str, Dict]) -> int:
@@ -657,10 +659,13 @@ def execute_sft_adam_sequential(
     tracker=None,
     **kwargs: Any,
 ) -> AutoModelForCausalLM:
-    """Sequential RhoEdit. ``tracker`` (SequentialEditTracker) is optional and
-    only adds per-round evaluation/plotting; the edit path is unchanged."""
+    """Sequential RhoEdit (Algorithm 1 when ``edit_cache_style=sequential``).
+
+    ``tracker`` (SequentialEditTracker) is optional and only adds per-round
+    evaluation/plotting; the edit path is unchanged.
+    """
     device = model.device
-    cache_style = getattr(hparams, "edit_cache_style", "mix")
+    cache_style = getattr(hparams, "edit_cache_style", "sequential")
     
     if tok.padding_side != "right":
         tok.padding_side = "right"
@@ -680,15 +685,17 @@ def execute_sft_adam_sequential(
     layer_to_cov_cache_old = calculate_cov_cache_with_old_data(
         model, tok, hparams, force_recompute=False
     )
-    # Algorithm 1: retention starts from capability factors only.
-    retention = _strip_task_factors(layer_to_cov_cache_old)
+    # Algorithm 1: (A_bar_0, B_bar_0, M_0) <- (A_cap, B_cap, N), N = |D_cap|.
+    retention = _with_sample_count(
+        layer_to_cov_cache_old, _cache_sample_size(hparams)
+    )
 
     # mix/disable still train the first chunk with the startup wiki+task pair.
     # sequential waits until the current-chunk edit factors are estimated.
     if cache_style == "sequential":
         print(
             "[RhoEdit] edit_cache_style=sequential uses Algorithm 1 "
-            f"(online retention, M_0={_retention_sample_count(retention)})."
+            f"(post-update mix, M_0={_retention_sample_count(retention)})."
         )
         opt = None
     else:
@@ -798,11 +805,13 @@ def execute_sft_adam_sequential(
         state_ref = layer_to_cov_cache_old
         
         if cache_style == "sequential":
+            t_k = len(txt_edit)
             print(
-                f"[RhoEdit] Fold this round's edit K-FAC "
-                f"({len(txt_edit)} samples, estimated at theta_{{k-1}}) into cap."
+                f"[RhoEdit] Re-estimate edit K-FAC on {t_k} current-chunk "
+                f"samples at theta_k, then mix into retention (T_k={t_k})."
             )
-            retention = update_retention_eq13(retention, edit_cache)
+            post_cache = estimate_chunk_kfac(txt_edit, tgt_edit, model, tok, hparams)
+            retention = update_retention_eq13(retention, post_cache, t_k)
             print(f"[RhoEdit] Retention M_k={_retention_sample_count(retention)}.")
             state_ref = retention
 
