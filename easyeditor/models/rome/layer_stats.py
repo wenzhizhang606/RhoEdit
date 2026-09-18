@@ -32,6 +32,16 @@ STAT_TYPES = {
 }
 
 
+def _kfac_normalize(A, B, total_tokens):
+    if total_tokens is None or int(total_tokens) <= 0:
+        raise RuntimeError(
+            "K-FAC accumulated 0 valid tokens; dividing by 0 would produce NaN "
+            "and fail later in ProjectedAdam Cholesky."
+        )
+    n = int(total_tokens)
+    return A / n, B / n, n
+
+
 def main():
     """
     Command-line utility to precompute cached stats.
@@ -623,8 +633,9 @@ def layer_stats_kfac_one_pass(
         param.requires_grad = grads[name]
 
     for layer_name in missing_layers:
-        A = matrices[layer_name]["A"] / total_tokens
-        B = matrices[layer_name]["B"] / total_tokens
+        A, B, n = _kfac_normalize(
+            matrices[layer_name]["A"], matrices[layer_name]["B"], total_tokens
+        )
         
         # Save individually to match original file structure
         # if force_recompute then we skip saving
@@ -632,9 +643,9 @@ def layer_stats_kfac_one_pass(
             file_extension = f"{model_name}/{ds_name}_stats/{layer_name}_{precision}_kfac{size_suffix}.npz"
             filename = stats_dir / file_extension
             filename.parent.mkdir(parents=True, exist_ok=True)
-            torch.save({'A': A, 'B': B, 'N': total_tokens}, filename)
+            torch.save({'A': A, 'B': B, 'N': n}, filename)
         
-        results[layer_name] = (A, B, total_tokens)
+        results[layer_name] = (A, B, n)
 
     return results
 
@@ -952,7 +963,10 @@ def layer_stats_kfac_with_txt_tgt(
 
     for layer_name in layer_names:
         cov_cache = layer_to_cov_cache.pop(layer_name)
-        layer_to_cov_cache[layer_name] = (cov_cache["A"].to("cpu")/total_tokens, cov_cache["B"].to("cpu")/total_tokens, total_tokens)
+        A, B, n = _kfac_normalize(
+            cov_cache["A"].to("cpu"), cov_cache["B"].to("cpu"), total_tokens
+        )
+        layer_to_cov_cache[layer_name] = (A, B, n)
         del cov_cache
         torch.cuda.empty_cache()
 

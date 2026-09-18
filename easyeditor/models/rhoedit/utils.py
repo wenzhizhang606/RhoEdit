@@ -50,6 +50,75 @@ def _model_device(model) -> torch.device:
     return getattr(model, "device", next(model.parameters()).device)
 
 
+def _embed_device(model) -> torch.device:
+    embed = model.get_input_embeddings()
+    weight = getattr(embed, "weight", None)
+    if weight is not None:
+        return weight.device
+    return _model_device(model)
+
+
+def _tokenize_sft_batch(
+    model,
+    tok: AutoTokenizer,
+    txt: List[str],
+    tgt: List[str],
+    max_length: int,
+) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
+    """Tokenize prompt+target with the same label mask as GitHub training.
+
+    Loss is computed in ``_causal_nll`` against ``lm_head`` width. Do not pass
+    ``labels`` into HuggingFace: transformers 4.46 uses
+    ``logits.view(-1, config.vocab_size)``, which CUDA-asserts when Llama's
+    added PAD id equals the original vocab size.
+    """
+    encodings = tok(
+        [prefix + suffix for prefix, suffix in zip(txt, tgt)],
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=max_length,
+    )
+    encodings = {key: value.to(_embed_device(model)) for key, value in encodings.items()}
+    labels = encodings["input_ids"].clone()
+    if tok.pad_token_id is not None:
+        labels[labels == tok.pad_token_id] = -100
+    seq_len = labels.size(1)
+    for i, prompt in enumerate(txt):
+        prompt_len = len(
+            tok(
+                prompt,
+                add_special_tokens=True,
+                truncation=True,
+                max_length=max_length,
+            )["input_ids"]
+        )
+        labels[i, : min(prompt_len, seq_len)] = -100
+    return encodings, labels
+
+
+def _causal_nll(
+    model,
+    encodings: Dict[str, torch.Tensor],
+    labels: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    """NLL on logits[..., :-1] vs labels[..., 1:], class dim = lm_head width."""
+    outputs = model(**encodings, use_cache=False)
+    logits = outputs.logits
+    shift_logits = logits[:, :-1, :].float().contiguous()
+    shift_labels = labels[:, 1:].to(device=shift_logits.device)
+    num_classes = shift_logits.size(-1)
+    invalid = (shift_labels >= num_classes) | ((shift_labels < 0) & (shift_labels != -100))
+    shift_labels = shift_labels.masked_fill(invalid, -100)
+    if int((shift_labels != -100).sum()) == 0:
+        return None
+    return torch.nn.functional.cross_entropy(
+        shift_logits.reshape(-1, num_classes),
+        shift_labels.reshape(-1),
+        ignore_index=-100,
+    )
+
+
 def _layer_names(hparams) -> List[str]:
     return [hparams.rewrite_module_tmp.format(layer) for layer in hparams.layers]
 
@@ -526,6 +595,17 @@ def update_model_and_tokenizer_with_appropriate_padding_token(model, tokenizer, 
         tokenizer.add_special_tokens({"pad_token": "[PAD]"})
         model.resize_token_embeddings(len(tokenizer), mean_resizing=False)
         model.config.pad_token_id = tokenizer.pad_token_id
+        model.config.vocab_size = int(len(tokenizer))
+        gen = getattr(model, "generation_config", None)
+        if gen is not None:
+            gen.pad_token_id = tokenizer.pad_token_id
+        lm_head = model.get_output_embeddings()
+        if lm_head is not None and int(lm_head.weight.shape[0]) != len(tokenizer):
+            raise RuntimeError(
+                "resize_token_embeddings did not grow lm_head to match tokenizer "
+                f"({lm_head.weight.shape[0]} vs {len(tokenizer)}); "
+                "Llama pad_id would CUDA-assert in embedding lookup."
+            )
     return model, tokenizer
 
 
@@ -579,7 +659,6 @@ def execute_sft_adam(
     **kwargs: Any,
 ) -> AutoModelForCausalLM:
     print("[execute_sft_adam]Enter the function")
-    device = model.device
     if tok.padding_side != "right":
         tok.padding_side = "right"
     
@@ -614,18 +693,15 @@ def execute_sft_adam(
         for txt, tgt in zip(
             chunks(texts, hparams.batch_size), chunks(targets, hparams.batch_size)
         ):
-            inputs_targets = [txt_ + tgt_ for txt_, tgt_ in zip(txt, tgt)]
-            encodings = tok(inputs_targets, return_tensors="pt", padding=True, truncation=True, max_length=hparams.max_length).to(device)
-            labels = encodings["input_ids"].clone()
-
-            labels[labels == tok.pad_token_id] = -100
-            for i, prompt in enumerate(txt):
-                prompt_len = len(tok(prompt, add_special_tokens=True, truncation=True, max_length=hparams.max_length)["input_ids"])
-                labels[i, :prompt_len] = -100
+            encodings, labels = _tokenize_sft_batch(
+                model, tok, txt, tgt, hparams.max_length
+            )
             opt.zero_grad(set_to_none=True)
-            outputs = model(**encodings, labels=labels)
-            loss = outputs.loss
-                
+            loss = _causal_nll(model, encodings, labels)
+            if loss is None or not torch.isfinite(loss):
+                print("[RhoEdit] skip batch: empty target or non-finite loss")
+                continue
+
             loss_meter.update(loss.item(), n=labels.size(0))
             if loss.item() >= 1e-2:
                 loss.backward()
@@ -664,7 +740,6 @@ def execute_sft_adam_sequential(
     ``tracker`` (SequentialEditTracker) is optional and only adds per-round
     evaluation/plotting; the edit path is unchanged.
     """
-    device = model.device
     cache_style = getattr(hparams, "edit_cache_style", "sequential")
     
     if tok.padding_side != "right":
@@ -737,31 +812,14 @@ def execute_sft_adam_sequential(
             for txt, tgt in zip(
                 chunks(txt_edit, hparams.batch_size), chunks(tgt_edit, hparams.batch_size)
             ):
-                inputs_targets = [txt_ + tgt_ for txt_, tgt_ in zip(txt, tgt)]
-                encodings = tok(
-                    inputs_targets,
-                    return_tensors="pt",
-                    padding=True,
-                    truncation=True,
-                    max_length=hparams.max_length,
-                ).to(device)
-
-                labels = encodings["input_ids"].clone()
-
-                labels[labels == tok.pad_token_id] = -100
-                for i, prompt in enumerate(txt):
-                    prompt_len = len(
-                        tok(
-                            prompt,
-                            add_special_tokens=True,
-                            truncation=True,
-                            max_length=hparams.max_length,
-                        )["input_ids"]
-                    )
-                    labels[i, :prompt_len] = -100
+                encodings, labels = _tokenize_sft_batch(
+                    model, tok, txt, tgt, hparams.max_length
+                )
                 opt.zero_grad()
-                outputs = model(**encodings, labels=labels)
-                loss = outputs.loss
+                loss = _causal_nll(model, encodings, labels)
+                if loss is None or not torch.isfinite(loss):
+                    print("[RhoEdit] skip batch: empty target or non-finite loss")
+                    continue
 
                 if loss.item() >= 1e-2:
                     loss.backward()

@@ -80,22 +80,12 @@ class ProjectedAdam(Adam):
             if projected is not None:
                 exp_avg.copy_(projected)
 
-    # Qwen2.5-7B down_proj input dim is 18944; GPU eigh of that fp64
-    # factor asks for ~8 GiB extra workspace and OOMs next to the model.
-    _CPU_FACTOR_DIM = 8192
-
     @staticmethod
     def _tensor(cache: Dict, key: str, like: torch.Tensor, dtype: torch.dtype):
         value = cache.get(key, None)
         if value is None:
             return None
         return value.to(device=like.device, dtype=dtype)
-
-    @classmethod
-    def _factor_work_device(cls, tensor: torch.Tensor) -> torch.device:
-        if max(tensor.shape) >= cls._CPU_FACTOR_DIM:
-            return torch.device("cpu")
-        return tensor.device
 
     @staticmethod
     def _symmetrize(matrix: torch.Tensor) -> torch.Tensor:
@@ -141,6 +131,43 @@ class ProjectedAdam(Adam):
                 f"eig_b={tuple(eig_b.shape)}, q_b={tuple(q_b.shape)}."
             )
 
+    def _regularized_cholesky(self, matrix: torch.Tensor) -> torch.Tensor:
+        """Cholesky of a possibly rank-deficient or non-finite K-FAC factor.
+
+        Sequential chunks cannot span a 14k–19k input dim, and A/0 yields NaN.
+        Increase jitter, then project onto the PD cone.
+        """
+        if not torch.isfinite(matrix).all():
+            print("[RhoEdit] edit-factor has non-finite values; replacing with 0.")
+            matrix = torch.nan_to_num(matrix, nan=0.0, posinf=0.0, neginf=0.0)
+            matrix = self._symmetrize(matrix)
+
+        n = matrix.shape[0]
+        eye = torch.eye(n, device=matrix.device, dtype=matrix.dtype)
+        trace_scale = matrix.diagonal().abs().mean().clamp(min=1e-12)
+        # Same first jitter as GitHub: λ * mean(|diag|). Retries only if that fails.
+        eps = float(self.factor_damping) * float(trace_scale)
+        if eps <= 0:
+            eps = 1e-8 * float(trace_scale)
+
+        for attempt in range(8):
+            try:
+                return torch.linalg.cholesky(matrix + eps * eye)
+            except (RuntimeError, torch.linalg.LinAlgError):
+                eps *= 10.0
+                if attempt == 0 or attempt == 7:
+                    print(
+                        f"[RhoEdit] edit-factor Cholesky not PD "
+                        f"(n={n}); retry eps={eps:.3e}"
+                    )
+
+        print("[RhoEdit] Cholesky retries failed; projecting edit factor onto PD cone.")
+        eigs, vecs = torch.linalg.eigh(matrix)
+        min_eig = max(eps, float(trace_scale) * max(float(self.factor_damping), 1e-8))
+        eigs = torch.clamp(eigs, min=min_eig)
+        pd = self._symmetrize((vecs * eigs.unsqueeze(0)) @ vecs.transpose(-1, -2))
+        return torch.linalg.cholesky(pd)
+
     def _generalized_basis(self, edit_factor, cap_factor):
         # Solve Q^T A_e Q = I and Q^T A_c Q = diag(a) via damped Cholesky:
         # A_e_reg = L L^T, whitened = L^{-1} A_c L^{-T}, then q = L^{-T} V.
@@ -154,14 +181,7 @@ class ProjectedAdam(Adam):
         edit_factor = self._symmetrize(edit_factor)
         cap_factor = self._symmetrize(cap_factor)
 
-        n = edit_factor.shape[0]
-        trace_scale = edit_factor.diagonal().abs().mean().clamp(min=1e-12)
-        eps = self.factor_damping * trace_scale
-        edit_factor_reg = edit_factor + eps * torch.eye(
-            n, device=edit_factor.device, dtype=edit_factor.dtype
-        )
-
-        L = torch.linalg.cholesky(edit_factor_reg)
+        L = self._regularized_cholesky(edit_factor)
         tmp = torch.linalg.solve_triangular(L, cap_factor, upper=False)
         whitened_cap = torch.linalg.solve_triangular(L, tmp.T, upper=False).T
         cap_eigs, cap_vecs = torch.linalg.eigh(whitened_cap)
