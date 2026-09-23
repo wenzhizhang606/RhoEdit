@@ -411,6 +411,31 @@ def _with_sample_count(caches: Dict[str, Dict], n: int) -> Dict[str, Dict]:
     }
 
 
+def _with_token_count(caches: Dict[str, Dict]) -> Dict[str, Dict]:
+    """Copy A/B and keep the token count the K-FAC pass stored in ``num_samples``.
+
+    Both ``layer_stats_kfac_one_pass`` (Wikipedia) and
+    ``layer_stats_kfac_with_txt_tgt`` (edit chunks) return ``total_tokens`` as the
+    third element, so the mix weight becomes the number of tokens that entered
+    each per-token-averaged A/B instead of the number of documents/requests.
+    """
+    return {
+        layer_name: {
+            "A": cache["A"],
+            "B": cache["B"],
+            "num_samples": max(int(cache.get("num_samples", 0)), 1),
+        }
+        for layer_name, cache in caches.items()
+    }
+
+
+def _retention_weight_mode(hparams) -> str:
+    mode = str(getattr(hparams, "retention_weight", "samples") or "samples").lower()
+    if mode not in ("samples", "tokens"):
+        raise ValueError(f"retention_weight must be 'samples' or 'tokens', got {mode!r}")
+    return mode
+
+
 def pair_retention_with_edit(
     retention: Dict[str, Dict],
     edit_cache: Dict[str, Dict],
@@ -434,14 +459,20 @@ def update_retention_eq13(
     retention: Dict[str, Dict],
     new_chunk_cache: Dict[str, Dict],
     t_k: int,
+    weight_mode: str = "tokens",
 ) -> Dict[str, Dict]:
-    """Algorithm 1 sample-weighted mix of post-update edit factors into retention.
+    """Algorithm 1 weighted mix of post-update edit factors into retention.
 
     M_k = M_{k-1} + T_k
     A_bar_k = (M_{k-1} A_bar_{k-1} + T_k A_k) / M_k
-    where T_k = |D_edit^{(k)}| and (A_k, B_k) are estimated on theta_k.
+    where (A_k, B_k) are estimated on theta_k and
+      weight_mode="samples": T_k = |D_edit^{(k)}| (requests in the chunk),
+      weight_mode="tokens":  T_k = tokens that entered (A_k, B_k).
     """
-    incoming = _with_sample_count(new_chunk_cache, t_k)
+    if weight_mode == "tokens":
+        incoming = _with_token_count(new_chunk_cache)
+    else:
+        incoming = _with_sample_count(new_chunk_cache, t_k)
     return combine_layer_to_cov_caches([retention, incoming])
 
 
@@ -685,17 +716,23 @@ def execute_sft_adam_sequential(
     layer_to_cov_cache_old = calculate_cov_cache_with_old_data(
         model, tok, hparams, force_recompute=False
     )
-    # Algorithm 1: (A_bar_0, B_bar_0, M_0) <- (A_cap, B_cap, N), N = |D_cap|.
-    retention = _with_sample_count(
-        layer_to_cov_cache_old, _cache_sample_size(hparams)
-    )
+    # Algorithm 1: (A_bar_0, B_bar_0, M_0) <- (A_cap, B_cap, N).
+    #   samples: N = |D_cap| documents (cache_sample_num)
+    #   tokens:  N = tokens that entered the Wikipedia K-FAC pass
+    weight_mode = _retention_weight_mode(hparams)
+    if weight_mode == "tokens":
+        retention = _with_token_count(layer_to_cov_cache_old)
+    else:
+        retention = _with_sample_count(
+            layer_to_cov_cache_old, _cache_sample_size(hparams)
+        )
 
     # mix/disable still train the first chunk with the startup wiki+task pair.
     # sequential waits until the current-chunk edit factors are estimated.
     if cache_style == "sequential":
         print(
             "[RhoEdit] edit_cache_style=sequential uses Algorithm 1 "
-            f"(post-update mix, M_0={_retention_sample_count(retention)})."
+            f"(post-update mix, weight={weight_mode}, M_0={_retention_sample_count(retention)})."
         )
         opt = None
     else:
@@ -811,8 +848,8 @@ def execute_sft_adam_sequential(
                 f"samples at theta_k, then mix into retention (T_k={t_k})."
             )
             post_cache = estimate_chunk_kfac(txt_edit, tgt_edit, model, tok, hparams)
-            retention = update_retention_eq13(retention, post_cache, t_k)
-            print(f"[RhoEdit] Retention M_k={_retention_sample_count(retention)}.")
+            retention = update_retention_eq13(retention, post_cache, t_k, weight_mode=weight_mode)
+            print(f"[RhoEdit] Retention M_k={_retention_sample_count(retention)} ({weight_mode}).")
             state_ref = retention
 
         elif cache_style == "mix":

@@ -14,6 +14,7 @@ from vllm import LLM
 import numpy as np
 from easyeditor.evaluate.evaluate import compute_edit_quality, compute_edit_quality_safety
 from easyeditor.evaluate.evaluate_utils import resolve_pending_llm_judges
+import gc
 import random
 import torch
 from tqdm import tqdm
@@ -49,6 +50,40 @@ def get_model_and_tokenizer_from_dir(edited_model_dir_local):
         gpu_memory_utilization=0.9,
     )
     return model, tokenizer
+
+def release_vllm_gpu(model):
+    """Unload vLLM after generation so judging no longer occupies the GPU."""
+    print("[vLLM] generation finished, releasing GPU")
+    try:
+        from vllm.distributed.parallel_state import destroy_model_parallel
+        destroy_model_parallel()
+    except Exception as exc:
+        print(f"[vLLM] destroy_model_parallel skipped: {exc}")
+
+    engine = getattr(model, "llm_engine", None)
+    executor = getattr(engine, "model_executor", None) if engine is not None else None
+    if executor is not None:
+        shutdown = getattr(executor, "shutdown", None)
+        if callable(shutdown):
+            try:
+                shutdown()
+            except Exception as exc:
+                print(f"[vLLM] executor.shutdown skipped: {exc}")
+        if hasattr(executor, "driver_worker"):
+            executor.driver_worker = None
+        engine.model_executor = None
+    if engine is not None:
+        model.llm_engine = None
+    del engine, executor
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        free, total = torch.cuda.mem_get_info()
+        print(f"[vLLM] GPU free {free / 1e9:.2f}/{total / 1e9:.2f} GB")
+    if hasattr(torch, "set_default_device"):
+        torch.set_default_device("cpu")
+    print("[vLLM] subsequent steps run on CPU")
 
 def get_arguments():
     parser = argparse.ArgumentParser()
@@ -123,6 +158,9 @@ if __name__ == "__main__":
         all_metrics.append(metrics)
         with open(os.path.join(log_dir, "results_pending_judge.json"), "w", encoding="utf-8") as f:
             json.dump(all_metrics, f, ensure_ascii=False, indent=4)
+
+    release_vllm_gpu(model)
+    del model
 
     if args.evaluation_criteria == "llm_judge":
         all_metrics = resolve_pending_llm_judges(
