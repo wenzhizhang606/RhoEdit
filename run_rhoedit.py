@@ -3,6 +3,8 @@ import numpy as np
 import os
 from dotenv import load_dotenv
 load_dotenv()
+# Contiguous allocator helps large K-FAC work sit next to the 7B shards.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 from easyeditor.models.rhoedit.utils import (
     KFAC_DATASET_ALIASES,
     normalize_kfac_dataset,
@@ -20,7 +22,7 @@ os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 import argparse
 import torch
 
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from easyeditor.models.rhoedit import (
     AdamHyperParams,
@@ -98,6 +100,19 @@ def get_arguments():
                         help='Override YAML soft_lambda when set.')
     parser.add_argument('--lr', type=float, default=None,
                         help='Override YAML lr when set.')
+    parser.add_argument(
+        '--layers',
+        type=str,
+        default=None,
+        help='Comma-separated edit layer indices, e.g. 14,15,16,17,18,19,20,21,22,23.',
+    )
+    parser.add_argument(
+        '--max_samples',
+        type=int,
+        default=None,
+        help='After the sequential train shuffle (seed 69), keep only the first N '
+             'requests. N=100 is one Algorithm-1 chunk, for hyperparameter screening.',
+    )
 
     args = parser.parse_args()
     return args
@@ -130,6 +145,11 @@ def get_hparams(args):
         hparams.newton_damping = args.newton_damping
     if args.soft_lambda is not None:
         hparams.soft_lambda = args.soft_lambda
+    if args.layers:
+        hparams.layers = [int(x) for x in args.layers.split(",") if x.strip()]
+        if not hparams.layers:
+            raise ValueError("--layers parsed to an empty list")
+    print(f"[RhoEdit] edit layers={hparams.layers}")
 
     hparams.edit_n_samples = args.edit_sample_num
     hparams.recalculate_cache = args.recalculate_cache
@@ -137,6 +157,8 @@ def get_hparams(args):
     hparams.edit_cache_style = args.edit_cache_style
 
     hparams.disable_old_loss_check = args.disable_old_loss_check
+    hparams.data_seed = SEED
+    hparams.max_samples = args.max_samples
 
 
     if args.sequential_edit:
@@ -148,9 +170,11 @@ def get_hparams(args):
 
 
 def calculate_model_name(args, hparams):
+    layer_tag = f"{min(hparams.layers)}_{max(hparams.layers)}"
     name = (f"{args.model}_rhoedit_adam_{args.data_type}"
                         f"_{hparams.task_mom2_dataset}"
-                        f"_{hparams.newton_damping}_{hparams.soft_lambda}_{hparams.lr}_12_19")
+                        f"_{hparams.newton_damping}_{hparams.soft_lambda}_{hparams.lr}"
+                        f"_n{int(hparams.mom2_n_samples)}_{layer_tag}")
 
     if args.sequential_edit:
         name += f"_sequential_{args.num_edits}"
@@ -159,6 +183,8 @@ def calculate_model_name(args, hparams):
         name += f"_recalc_cache_{args.recalculate_weight_threshold}_edit_sample_{args.edit_sample_num}"
     if args.sequential_edit:
         name += f"_edit_cache_{args.edit_cache_style}"
+    if args.max_samples:
+        name += f"_firstchunk_{args.max_samples}"
 
     return name.replace('.', '_')
 
@@ -169,6 +195,7 @@ if __name__ == "__main__":
     hparams = get_hparams(args)
 
     save_model_name = calculate_model_name(args, hparams)
+    hparams.run_name = save_model_name
     print(f"Model will be saved to BASE_DIR/{save_model_name}")
 
     ExperimentTracker.init(project=args.wandb_project, name=save_model_name, config=vars(hparams),
@@ -191,27 +218,46 @@ if __name__ == "__main__":
         local_files_only=True,
     )
 
-    config = AutoConfig.from_pretrained(
-        MODEL_NAME,
-        local_files_only=True,
-    )
-
-    device_map = {
-        "model.embed_tokens": 1,
-        "model.rotary_emb": 1,
-    }
-
-    for layer in range(config.num_hidden_layers):
-        device_map[f"model.layers.{layer}"] = 0 if  12 <= layer <= 19 else 1
-
-    device_map["model.norm"] = 1
-    device_map["lm_head"] = 1
-
+    # device_map="auto" (contiguous split). Qwen wiki needs ≥2×48GB; Llama
+    # sequential is launched with 3. Cross-GPU tensors are staged through
+    # host by patch_device_map_host_transfers() because P2P copies on this
+    # machine return garbage (all-NaN logits from layer 0).
+    n_visible = torch.cuda.device_count()
+    if n_visible < 2:
+        raise RuntimeError(
+            f"RhoEdit device_map=auto needs ≥2 visible GPUs; "
+            f"got {n_visible}. CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}"
+        )
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
-        device_map=device_map,
+        device_map="auto",
         local_files_only=True,
     )
+    dmap = getattr(model, "hf_device_map", {}) or {}
+    print(
+        f"[RhoEdit] auto device_map visible={n_visible} "
+        f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')} "
+        f"attn={model.config._attn_implementation}"
+    )
+    for key in (
+        "model.embed_tokens",
+        "model.layers.0",
+        "model.layers.12",
+        "model.layers.19",
+        "model.layers.27",
+        "model.norm",
+        "lm_head",
+    ):
+        if key in dmap:
+            print(f"  {key} -> cuda:{dmap[key]}")
+    offloaded = sorted({str(v) for v in dmap.values() if v in ("cpu", "disk")})
+    if offloaded:
+        # Happens when the assigned GPUs are still busy (e.g. overlapping jobs):
+        # accelerate silently offloads and the run becomes slow/wrong.
+        raise RuntimeError(
+            f"device_map=auto offloaded modules to {offloaded}; the assigned GPUs "
+            f"are not free. CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}"
+        )
     '''
     # llama3
     tokenizer = AutoTokenizer.from_pretrained(

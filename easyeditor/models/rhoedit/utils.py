@@ -1,5 +1,8 @@
 import gc
+import json
 import os
+import time
+from collections.abc import Mapping
 from copy import deepcopy
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -50,6 +53,370 @@ def _model_device(model) -> torch.device:
     return getattr(model, "device", next(model.parameters()).device)
 
 
+def _embed_device(model) -> torch.device:
+    embed = model.get_input_embeddings()
+    weight = getattr(embed, "weight", None)
+    if weight is not None:
+        return weight.device
+    return _model_device(model)
+
+
+def _lm_head_device(model) -> torch.device:
+    lm_head = model.get_output_embeddings()
+    weight = getattr(lm_head, "weight", None)
+    if weight is not None:
+        return weight.device
+    return _embed_device(model)
+
+
+def _to_device_via_host(tensor: torch.Tensor, device) -> torch.Tensor:
+    """Move a tensor, routing GPU->GPU moves through host memory.
+
+    Direct peer copies (``cuda:1 -> cuda:0``) return stale/garbage memory on
+    hosts where PCIe P2P is broken (AMD IOMMU without ``iommu=pt`` is the
+    usual culprit). CUDA still reports ``can_device_access_peer=True`` there,
+    so PyTorch happily takes the P2P path. Host-staged copies are always
+    correct; the tensors crossing shard boundaries are small (mask, rotary
+    cos/sin, one hidden-state block), so the cost is negligible.
+    """
+    device = torch.device(device)
+    if tensor.device == device:
+        return tensor
+    if tensor.device.type == "cuda" and device.type == "cuda":
+        return tensor.cpu().to(device)
+    return tensor.to(device)
+
+
+def _stage_cross_cuda(obj, device: torch.device, skip_keys=()):
+    """Recursively pull tensors that would cross GPUs onto the host first."""
+    if torch.is_tensor(obj):
+        if obj.device.type == "cuda" and obj.device != device:
+            return obj.cpu()
+        return obj
+    if isinstance(obj, (list, tuple)):
+        staged = [_stage_cross_cuda(o, device, skip_keys) for o in obj]
+        if hasattr(obj, "_fields"):  # namedtuple
+            return type(obj)(*staged)
+        return type(obj)(staged)
+    if isinstance(obj, Mapping):
+        return type(obj)(
+            {
+                k: (v if k in skip_keys else _stage_cross_cuda(v, device, skip_keys))
+                for k, v in obj.items()
+            }
+        )
+    return obj
+
+
+def _patch_accelerate_host_transfers() -> None:
+    """Make Accelerate's device_map hooks stage GPU->GPU moves through host."""
+    try:
+        import accelerate.hooks as accelerate_hooks
+    except ImportError:
+        return
+    orig = accelerate_hooks.send_to_device
+    if getattr(orig, "_rhoedit_host_staged", False):
+        return
+
+    def send_to_device(tensor, device, non_blocking=False, skip_keys=None):
+        if isinstance(skip_keys, str):
+            skip = (skip_keys,)
+        else:
+            skip = tuple(skip_keys or ())
+        try:
+            target = torch.device(device)
+        except (TypeError, RuntimeError):
+            target = None
+        if target is not None and target.type == "cuda":
+            tensor = _stage_cross_cuda(tensor, target, skip)
+        return orig(tensor, device, non_blocking=non_blocking, skip_keys=skip_keys)
+
+    send_to_device._rhoedit_host_staged = True
+    accelerate_hooks.send_to_device = send_to_device
+
+
+def _check_gpu_p2p_copy(src: torch.device, dst: torch.device) -> bool:
+    """True if a direct ``src -> dst`` GPU copy round-trips bit-exactly."""
+    x = torch.randn(1 << 18, device=src)
+    torch.cuda.synchronize(src)
+    return torch.equal(x.to(dst).cpu(), x.cpu())
+
+
+def patch_device_map_host_transfers(model) -> bool:
+    """Keep multi-GPU ``device_map`` forwards off the GPU P2P copy path.
+
+    * Accelerate's ``send_to_device`` stages cross-GPU tensors via host.
+    * The top-level hook stops copying logits back to the embed GPU
+      (``io_same_device``), so the loss/backward stay on the lm_head GPU and
+      autograd never issues a GPU->GPU copy either.
+
+    Returns True when the model spans more than one CUDA device.
+    """
+    if getattr(model, "_rhoedit_host_transfers", False):
+        return True
+    cuda_devices = set()
+    for value in (getattr(model, "hf_device_map", {}) or {}).values():
+        if isinstance(value, int):
+            cuda_devices.add(torch.device("cuda", value))
+        elif isinstance(value, str) and value.startswith("cuda"):
+            cuda_devices.add(torch.device(value))
+    if len(cuda_devices) < 2:
+        return False
+
+    _patch_accelerate_host_transfers()
+    hook = getattr(model, "_hf_hook", None)
+    if hook is not None and getattr(hook, "io_same_device", False):
+        hook.io_same_device = False
+
+    devs = sorted(cuda_devices, key=lambda d: d.index)
+    p2p_ok = _check_gpu_p2p_copy(devs[1], devs[0]) and _check_gpu_p2p_copy(devs[0], devs[1])
+    state = "OK" if p2p_ok else "BROKEN (direct GPU->GPU copies return garbage)"
+    print(
+        f"[RhoEdit] device_map spans {[str(d) for d in devs]}; GPU P2P copy check: {state}. "
+        "Cross-GPU tensors are staged through host; logits stay on the lm_head GPU."
+    )
+    model._rhoedit_host_transfers = True
+    return True
+
+
+def _align_attn_mask(attention_mask, hidden_states, unmask_fn=None):
+    if attention_mask is None or not torch.is_tensor(attention_mask):
+        return attention_mask
+    if attention_mask.device != hidden_states.device:
+        attention_mask = _to_device_via_host(attention_mask, hidden_states.device)
+    if attention_mask.is_floating_point() and attention_mask.dtype != hidden_states.dtype:
+        attention_mask = attention_mask.to(dtype=hidden_states.dtype)
+    if attention_mask.dim() == 4:
+        attention_mask = attention_mask.contiguous()
+        if unmask_fn is not None:
+            min_dtype = torch.finfo(attention_mask.dtype).min
+            attention_mask = unmask_fn(attention_mask, min_dtype)
+        # Clone: Qwen slices `mask[..., :kv]` and later layers must not see
+        # in-place writes into that view (layer 13 was the first all-NaN layer).
+        attention_mask = attention_mask.contiguous().clone()
+    elif not attention_mask.is_contiguous():
+        attention_mask = attention_mask.contiguous()
+    return attention_mask
+
+
+def _align_position_embeddings(position_embeddings, hidden_states):
+    if not isinstance(position_embeddings, tuple):
+        return position_embeddings
+    aligned = []
+    for item in position_embeddings:
+        if not torch.is_tensor(item):
+            aligned.append(item)
+            continue
+        if item.device != hidden_states.device:
+            item = _to_device_via_host(item, hidden_states.device)
+        if item.is_floating_point() and item.dtype != hidden_states.dtype:
+            item = item.to(dtype=hidden_states.dtype)
+        item = item.contiguous().clone()
+        aligned.append(item)
+    return tuple(aligned)
+
+
+def _patch_sdpa_attn_mask(unmask_fn) -> None:
+    """Contiguous + unmask the custom attn_mask SDPA actually receives.
+
+    Qwen2SdpaAttention slices ``attention_mask[:, :, :, :kv]`` and only
+    ``contiguous()``s Q/K/V. A non-contiguous mask hits PyTorch #112577;
+    fully masked pad rows hit #110213. HuggingFace unmasks only for SDPA
+    and only when the *2D* mask is already on CUDA.
+    """
+    import torch.nn.functional as F
+
+    orig = F.scaled_dot_product_attention
+    if getattr(orig, "_rhoedit_mask_patched", False):
+        return
+
+    def _sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None):
+        if attn_mask is not None and torch.is_tensor(attn_mask):
+            if attn_mask.device != query.device:
+                attn_mask = _to_device_via_host(attn_mask, query.device)
+            if attn_mask.is_floating_point() and attn_mask.dtype != query.dtype:
+                attn_mask = attn_mask.to(dtype=query.dtype)
+            if attn_mask.dim() == 4:
+                attn_mask = attn_mask.contiguous()
+                if unmask_fn is not None:
+                    min_dtype = torch.finfo(attn_mask.dtype).min
+                    attn_mask = unmask_fn(attn_mask, min_dtype)
+                attn_mask = attn_mask.contiguous().clone()
+            elif not attn_mask.is_contiguous():
+                attn_mask = attn_mask.contiguous()
+        return orig(
+            query,
+            key,
+            value,
+            attn_mask=attn_mask,
+            dropout_p=dropout_p,
+            is_causal=is_causal,
+            scale=scale,
+        )
+
+    _sdpa._rhoedit_mask_patched = True
+    F.scaled_dot_product_attention = _sdpa
+
+
+def patch_qwen_device_map_attention(model) -> None:
+    """Keep Qwen2 4D causal masks valid under Accelerate ``device_map``.
+
+    The 4D mask is built on the embed GPU. Crossing devices can make it a
+    non-contiguous view, and SDPA's mem-efficient path then emits NaN (fully
+    masked pad rows do the same). Align dtype/device, ``contiguous()``, and
+    unmask attended rows before every decoder layer / SDPA call.
+
+    Do not wrap Accelerate ``_old_forward``: that calling convention previously
+    broke eager attention.
+    """
+    # Independent of the mask fix: any multi-GPU device_map must avoid P2P copies.
+    patch_device_map_host_transfers(model)
+    if getattr(model, "_rhoedit_attn_mask_patched", False):
+        return
+    inner = getattr(model, "model", None)
+    if inner is None or not hasattr(inner, "_update_causal_mask"):
+        return
+    try:
+        from transformers.modeling_attn_mask_utils import AttentionMaskConverter
+        unmask_fn = AttentionMaskConverter._unmask_unattended
+    except ImportError:
+        unmask_fn = None
+
+    orig_update = inner._update_causal_mask
+
+    def _update_causal_mask(attention_mask, input_tensor, cache_position=None, *args, **kwargs):
+        device = input_tensor.device
+        if attention_mask is not None and torch.is_tensor(attention_mask):
+            if attention_mask.device != device:
+                attention_mask = _to_device_via_host(attention_mask, device)
+            attention_mask = attention_mask.contiguous()
+            if attention_mask.dim() == 2:
+                attention_mask = attention_mask.clone()
+        if cache_position is not None and torch.is_tensor(cache_position) and cache_position.device != device:
+            cache_position = _to_device_via_host(cache_position, device)
+        causal_mask = orig_update(
+            attention_mask, input_tensor, cache_position, *args, **kwargs
+        )
+        if causal_mask is None:
+            return None
+        return _align_attn_mask(causal_mask, input_tensor, unmask_fn=unmask_fn)
+
+    inner._update_causal_mask = _update_causal_mask
+    _patch_sdpa_attn_mask(unmask_fn)
+
+    layers = getattr(inner, "layers", None)
+    if layers is None:
+        model._rhoedit_attn_mask_patched = True
+        return
+
+    def _layer_pre_hook(module, args, kwargs):
+        if not args:
+            return args, kwargs
+        hidden_states = args[0]
+        kwargs = dict(kwargs)
+        kwargs["attention_mask"] = _align_attn_mask(
+            kwargs.get("attention_mask"), hidden_states, unmask_fn=unmask_fn
+        )
+        position_ids = kwargs.get("position_ids")
+        if (
+            position_ids is not None
+            and torch.is_tensor(position_ids)
+            and position_ids.device != hidden_states.device
+        ):
+            kwargs["position_ids"] = _to_device_via_host(position_ids, hidden_states.device)
+        cache_position = kwargs.get("cache_position")
+        if (
+            cache_position is not None
+            and torch.is_tensor(cache_position)
+            and cache_position.device != hidden_states.device
+        ):
+            kwargs["cache_position"] = _to_device_via_host(cache_position, hidden_states.device)
+        if "position_embeddings" in kwargs:
+            kwargs["position_embeddings"] = _align_position_embeddings(
+                kwargs["position_embeddings"], hidden_states
+            )
+        return args, kwargs
+
+    for layer in layers:
+        layer.register_forward_pre_hook(_layer_pre_hook, with_kwargs=True)
+
+    model._rhoedit_attn_mask_patched = True
+    print("[RhoEdit] Patched Qwen attention masks for device_map")
+
+
+def _causal_nll(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    """Token-level CE on the model's actual logit width.
+
+    transformers 4.46 ``ForCausalLMLoss`` does ``view(-1, self.vocab_size)``
+    inside the forward. With a 3-GPU ``device_map`` that path also runs CE on
+    the pre-gather ``lm_head`` tensor and dies in CUDA ``nll_loss``. Using the
+    returned logits (and ``logits.size(-1)``) is the same causal NLL.
+    """
+    if logits.dim() != 3:
+        raise RuntimeError(f"causal NLL expected [B, T, V] logits, got {tuple(logits.shape)}")
+    if labels.dtype != torch.long:
+        raise RuntimeError(
+            f"causal NLL expected Long labels, got {labels.dtype} shape={tuple(labels.shape)}"
+        )
+    shift_logits = logits[..., :-1, :].contiguous()
+    # Snapshot on CPU first. A non-contiguous GPU view copied onto the logits
+    # device can pick up the 4D causal-mask buffer (finfo.min / 0-1 bytes).
+    shift_labels = labels[..., 1:].detach().contiguous().to(dtype=torch.long).cpu()
+    shift_labels = shift_labels.to(device=shift_logits.device)
+    if shift_logits.shape[:2] != shift_labels.shape[:2]:
+        raise RuntimeError(
+            f"causal NLL shape mismatch logits={tuple(shift_logits.shape)} "
+            f"labels={tuple(shift_labels.shape)}"
+        )
+    n_classes = shift_logits.size(-1)
+    ignored = shift_labels == -100
+    if bool(ignored.all()):
+        return shift_logits.sum() * 0.0
+    bad = (~ignored) & ((shift_labels < 0) | (shift_labels >= n_classes))
+    if bool(bad.any()):
+        sample = shift_labels[bad][:16].detach().cpu().tolist()
+        raise RuntimeError(
+            f"causal NLL labels outside [0, {n_classes}): {sample} "
+            f"logits={tuple(shift_logits.shape)} device={shift_logits.device}"
+        )
+    n_nan = int(torch.isnan(shift_logits).sum()) if shift_logits.is_floating_point() else 0
+    if n_nan:
+        raise RuntimeError(
+            f"causal NLL got {n_nan} NaN logits in {tuple(shift_logits.shape)}; "
+            "the forward produced NaNs (on multi-GPU device_map check the "
+            "'[RhoEdit] GPU P2P copy check' line: broken P2P copies corrupt "
+            "tensors that cross shard boundaries)"
+        )
+    return torch.nn.functional.cross_entropy(
+        shift_logits.view(-1, n_classes),
+        shift_labels.view(-1),
+        ignore_index=-100,
+    )
+
+
+def _sft_labels(encodings, tok: AutoTokenizer, txt: List[str], max_length: int) -> torch.Tensor:
+    """Prompt/pad-masked labels on CPU so device_map forwards cannot clobber them."""
+    labels = encodings["input_ids"].detach().to(dtype=torch.long).cpu().contiguous().clone()
+    attn = encodings.get("attention_mask")
+    if attn is not None:
+        labels[attn.detach().to(dtype=torch.long).cpu() == 0] = -100
+    else:
+        pad_id = tok.pad_token_id
+        if pad_id is not None:
+            labels[labels == pad_id] = -100
+    for i, prompt in enumerate(txt):
+        prompt_len = len(
+            tok(
+                prompt,
+                add_special_tokens=True,
+                truncation=True,
+                max_length=max_length,
+            )["input_ids"]
+        )
+        labels[i, :prompt_len] = -100
+    return labels
+
+
 def _layer_names(hparams) -> List[str]:
     return [hparams.rewrite_module_tmp.format(layer) for layer in hparams.layers]
 
@@ -71,6 +438,12 @@ def _build_cov_cache_from_hparams(
     layer_names = _layer_names(hparams)
     dtype_name = _cache_dtype_name(hparams)
     sample_size = _cache_sample_size(hparams)
+    if sample_size <= 0:
+        print(
+            "[RhoEdit] n=0: skip capability K-FAC; unconstrained Adam on edit weights.",
+            flush=True,
+        )
+        return {}
 
     raw_task_dataset = getattr(hparams, "task_mom2_dataset", None)
     task_mom2_dataset = normalize_kfac_dataset(raw_task_dataset)
@@ -296,7 +669,7 @@ def build_optimizer_with_cov_caches(
         return opt
 
     weights = get_weights(model, hparams)
-    return ProjectedAdam(
+    opt = ProjectedAdam(
         [v for _, v in weights.items()],
         projection_cache_map=weight_to_projection_cache,
         soft_lambda=getattr(hparams, "soft_lambda", 1.0),
@@ -304,6 +677,8 @@ def build_optimizer_with_cov_caches(
         lr=hparams.lr,
         weight_decay=hparams.weight_decay,
     )
+    opt.precompute_bases()
+    return opt
 
 
 def combine_layer_to_cov_caches(
@@ -469,11 +844,10 @@ def calculate_projection_caches_from_cov_caches(
 ):
     weight_to_projection_cache = {}
     weights = get_weights(model, hparams)
-    device = _model_device(model)
 
     for layer_name, cov_cache in layer_to_cov_caches.items():
-        A = cov_cache["A"].to(device=device, dtype=torch.float32)
-        B = cov_cache["B"].to(device=device, dtype=torch.float32)
+        A = cov_cache["A"].to(dtype=torch.float32)
+        B = cov_cache["B"].to(dtype=torch.float32)
 
         if not _is_llama_or_phi(hparams.model_name):
             A, B = B, A
@@ -494,8 +868,8 @@ def calculate_projection_caches_from_cov_caches(
                 "Pass the original capability cache, or call attach_task_factors, "
                 "so edit curvature is preserved."
             )
-        task_A = cov_cache["task_A"].to(device=device, dtype=torch.float32)
-        task_B = cov_cache["task_B"].to(device=device, dtype=torch.float32)
+        task_A = cov_cache["task_A"].to(dtype=torch.float32)
+        task_B = cov_cache["task_B"].to(dtype=torch.float32)
         task_num_samples = cov_cache.get("task_num_samples")
 
         if not _is_llama_or_phi(hparams.model_name):
@@ -571,6 +945,48 @@ class AverageMeter:
         self.count += n
         self.avg = self.sum / self.count
         
+def _peak_memory_gb() -> float:
+    if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
+        return 0.0
+    return max(
+        torch.cuda.max_memory_allocated(i) for i in range(torch.cuda.device_count())
+    ) / 1e9
+
+
+def _write_table23_train_stats(hparams, opt, train_t0: float) -> None:
+    energy_fn = getattr(opt, "mean_retained_edit_gradient_energy", None)
+    stats = {
+        "n": int(getattr(hparams, "mom2_n_samples", 0) or 0),
+        "lambda": float(getattr(hparams, "soft_lambda", 0.0)),
+        "lr": float(getattr(hparams, "lr", 0.0)),
+        "newton_damping": float(getattr(hparams, "newton_damping", 0.0)),
+        "time_h": (time.time() - train_t0) / 3600.0,
+        "memory_gb": _peak_memory_gb(),
+        "retained_edit_gradient_energy": (
+            float(energy_fn()) if callable(energy_fn) else 1.0
+        ),
+        "run_name": getattr(hparams, "run_name", None),
+    }
+    print(f"[RhoEdit] TABLE23_TRAIN {json.dumps(stats)}", flush=True)
+    ExperimentTracker.log(
+        {
+            "table23/time_h": stats["time_h"],
+            "table23/memory_gb": stats["memory_gb"],
+            "table23/retained_edit_gradient_energy": stats[
+                "retained_edit_gradient_energy"
+            ],
+        }
+    )
+    run_name = stats["run_name"]
+    if not run_name:
+        return
+    out_dir = os.path.join("logs", str(run_name))
+    os.makedirs(out_dir, exist_ok=True)
+    with open(os.path.join(out_dir, "table23_train.json"), "w", encoding="utf-8") as handle:
+        json.dump(stats, handle, indent=2)
+        handle.write("\n")
+
+
 def execute_sft_adam(
     model: AutoModelForCausalLM,
     tok: AutoTokenizer,
@@ -579,7 +995,20 @@ def execute_sft_adam(
     **kwargs: Any,
 ) -> AutoModelForCausalLM:
     print("[execute_sft_adam]Enter the function")
-    device = model.device
+    train_t0 = time.time()
+    if torch.cuda.is_available():
+        for idx in range(torch.cuda.device_count()):
+            torch.cuda.reset_peak_memory_stats(idx)
+    patch_qwen_device_map_attention(model)
+    # Keep Dropout/SDPA on the inference kernels. train() plus a Long tensor
+    # on the lm_head GPU makes 3-GPU SDPA return all-NaN logits.
+    model.eval()
+    # Reusing DynamicCache across batches with different padded lengths NaNs
+    # from the first layer on the edit GPU. Disable cache for the whole SFT.
+    model.config.use_cache = False
+    if getattr(model, "generation_config", None) is not None:
+        model.generation_config.use_cache = False
+    device = _embed_device(model)
     if tok.padding_side != "right":
         tok.padding_side = "right"
     
@@ -593,6 +1022,8 @@ def execute_sft_adam(
     )
     
     opt = build_optimizer_with_cov_caches(model, hparams, [layer_to_cov_cache_old])
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     weights = get_weights(model, hparams)
     current_weights_cpu = cache_weights_to_cpu(weights)
     for name, w in model.named_parameters():
@@ -615,20 +1046,17 @@ def execute_sft_adam(
             chunks(texts, hparams.batch_size), chunks(targets, hparams.batch_size)
         ):
             inputs_targets = [txt_ + tgt_ for txt_, tgt_ in zip(txt, tgt)]
-            encodings = tok(inputs_targets, return_tensors="pt", padding=True, truncation=True, max_length=hparams.max_length).to(device)
-            labels = encodings["input_ids"].clone()
-
-            labels[labels == tok.pad_token_id] = -100
-            for i, prompt in enumerate(txt):
-                prompt_len = len(tok(prompt, add_special_tokens=True, truncation=True, max_length=hparams.max_length)["input_ids"])
-                labels[i, :prompt_len] = -100
+            encodings = tok(inputs_targets, return_tensors="pt", padding="max_length", truncation=True, max_length=hparams.max_length).to(device)
+            labels = _sft_labels(encodings, tok, txt, hparams.max_length)
             opt.zero_grad(set_to_none=True)
-            outputs = model(**encodings, labels=labels)
-            loss = outputs.loss
+            outputs = model(**encodings, use_cache=False)
+            loss = _causal_nll(outputs.logits, labels)
                 
             loss_meter.update(loss.item(), n=labels.size(0))
             if loss.item() >= 1e-2:
                 loss.backward()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 opt.step()
                 current_weights_cpu, layer_to_cov_cache_old, should_recalculate = recalculate_cov_cache_if_weights_changed(
                     model,
@@ -648,7 +1076,8 @@ def execute_sft_adam(
 
         if loss_meter.avg < 1e-2:
             break
-    
+
+    _write_table23_train_stats(hparams, opt, train_t0)
     return model
 
 def execute_sft_adam_sequential(
@@ -664,7 +1093,12 @@ def execute_sft_adam_sequential(
     ``tracker`` (SequentialEditTracker) is optional and only adds per-round
     evaluation/plotting; the edit path is unchanged.
     """
-    device = model.device
+    patch_qwen_device_map_attention(model)
+    model.eval()
+    model.config.use_cache = False
+    if getattr(model, "generation_config", None) is not None:
+        model.generation_config.use_cache = False
+    device = _embed_device(model)
     cache_style = getattr(hparams, "edit_cache_style", "sequential")
     
     if tok.padding_side != "right":
@@ -674,7 +1108,20 @@ def execute_sft_adam_sequential(
     for i, request in enumerate(requests):
         if request["target_new"] and request["target_new"][0] != " ":
             requests[i]["target_new"] = " " + request["target_new"]
-    random.shuffle(requests)
+    max_samples = getattr(hparams, "max_samples", None)
+    data_seed = int(getattr(hparams, "data_seed", 69))
+    if max_samples is not None:
+        if max_samples <= 0:
+            raise ValueError("hparams.max_samples must be > 0")
+        rng = random.Random(data_seed)
+        rng.shuffle(requests)
+        requests = requests[:max_samples]
+        print(
+            f"[RhoEdit] first-chunk screen: data_seed={data_seed} "
+            f"n={len(requests)} num_edits={hparams.num_edits}"
+        )
+    else:
+        random.shuffle(requests)
     texts = [r["prompt"] for r in requests]
     targets = [r["target_new"] for r in requests]
     rephrases = [r.get("rephrase_prompt") for r in requests]
@@ -700,6 +1147,8 @@ def execute_sft_adam_sequential(
         opt = None
     else:
         opt = build_optimizer_with_cov_caches(model, hparams, [layer_to_cov_cache_old])
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     weights = get_weights(model, hparams)
     current_weights_cpu = cache_weights_to_cpu(weights)
         
@@ -741,27 +1190,14 @@ def execute_sft_adam_sequential(
                 encodings = tok(
                     inputs_targets,
                     return_tensors="pt",
-                    padding=True,
+                    padding="max_length",
                     truncation=True,
                     max_length=hparams.max_length,
                 ).to(device)
-
-                labels = encodings["input_ids"].clone()
-
-                labels[labels == tok.pad_token_id] = -100
-                for i, prompt in enumerate(txt):
-                    prompt_len = len(
-                        tok(
-                            prompt,
-                            add_special_tokens=True,
-                            truncation=True,
-                            max_length=hparams.max_length,
-                        )["input_ids"]
-                    )
-                    labels[i, :prompt_len] = -100
+                labels = _sft_labels(encodings, tok, txt, hparams.max_length)
                 opt.zero_grad()
-                outputs = model(**encodings, labels=labels)
-                loss = outputs.loss
+                outputs = model(**encodings, use_cache=False)
+                loss = _causal_nll(outputs.logits, labels)
 
                 if loss.item() >= 1e-2:
                     loss.backward()

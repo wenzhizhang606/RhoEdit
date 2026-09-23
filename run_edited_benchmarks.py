@@ -64,6 +64,15 @@ def get_arguments():
     parser.add_argument('--wandb_run_id', type=str, default=None, help='WandB run ID for resuming runs.')
     parser.add_argument('--no_wandb', action='store_true', help='Disable wandb logging.')
     parser.add_argument('--judge_batch_size', required=False, type=int, default=16, help='Number of generated answers to judge per batch.')
+    parser.add_argument(
+        '--train_seed',
+        type=int,
+        default=None,
+        help='If set with --eval_chunk/--num_edits, take the sequential train chunk '
+             '(Random(train_seed).shuffle) instead of the eval random.sample order.',
+    )
+    parser.add_argument('--eval_chunk', type=int, default=None, help='0-based sequential chunk to evaluate.')
+    parser.add_argument('--num_edits', type=int, default=None, help='Sequential chunk size; required with --train_seed.')
     args = parser.parse_args()
     return args
 
@@ -102,9 +111,25 @@ if __name__ == "__main__":
 
 
     print_time("Begin Post Edit Eval Time")
-    requests = random.sample(requests, len(requests))
-    if args.eval_num is not None:
-        requests = requests[:args.eval_num]
+    if args.train_seed is not None:
+        if args.eval_chunk is None or args.num_edits is None:
+            raise ValueError("--train_seed requires --eval_chunk and --num_edits")
+        if args.num_edits <= 0 or args.eval_chunk < 0:
+            raise ValueError("--num_edits must be > 0 and --eval_chunk >= 0")
+        rng = random.Random(args.train_seed)
+        rng.shuffle(requests)
+        start = args.eval_chunk * args.num_edits
+        end = start + args.num_edits
+        requests = requests[start:end]
+        print(
+            f"[eval] train_seed={args.train_seed} chunk={args.eval_chunk} "
+            f"num_edits={args.num_edits} n={len(requests)} "
+            f"(skipped eval random.sample)"
+        )
+    else:
+        requests = random.sample(requests, len(requests))
+        if args.eval_num is not None:
+            requests = requests[:args.eval_num]
 
     all_metrics = []
     log_dir = f"./logs/{run_name}"

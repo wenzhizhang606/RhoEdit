@@ -32,6 +32,57 @@ STAT_TYPES = {
 }
 
 
+def _shift_labels_on_logits_device(labels: torch.Tensor, shift_logits: torch.Tensor) -> torch.Tensor:
+    """Align CE labels with logits without a direct GPU->GPU copy.
+
+    On this host PCIe P2P copies return garbage, which previously showed up as
+    ``nll_loss`` device-side asserts (``t >= n_classes``) during K-FAC.
+    """
+    shift_labels = labels[..., 1:].contiguous()
+    if shift_labels.device != shift_logits.device:
+        shift_labels = shift_labels.cpu()
+    return shift_labels.to(device=shift_logits.device, dtype=torch.long)
+
+
+def _embed_device(model) -> torch.device:
+    embed = model.get_input_embeddings()
+    weight = getattr(embed, "weight", None)
+    if weight is not None:
+        return weight.device
+    return next(model.parameters()).device
+
+
+def _module_device(module) -> torch.device:
+    param = next(module.parameters(), None)
+    if param is None:
+        return torch.device("cpu")
+    return param.device
+
+
+def _host_to(tensor: torch.Tensor, device) -> torch.Tensor:
+    device = torch.device(device)
+    if tensor.device == device:
+        return tensor
+    if tensor.device.type == "cuda" and device.type == "cuda":
+        return tensor.cpu().to(device)
+    return tensor.to(device)
+
+
+def _kfac_accumulate(slot, feat_in, grad_out, valid_mask, dtype):
+    """Outer-product update on the layer GPU; mask is moved via host if needed."""
+    feat_in = feat_in[:, :-1, :]
+    grad_out = grad_out[:, :-1, :]
+    work = feat_in.device
+    mask = valid_mask if valid_mask.device == work else _host_to(valid_mask, work)
+    if slot["A"].device != work:
+        slot["A"] = _host_to(slot["A"], work)
+        slot["B"] = _host_to(slot["B"], work)
+    input_flat = feat_in[mask].to(dtype=dtype)
+    grad_flat = grad_out[mask].to(dtype=dtype)
+    slot["A"].addmm_(input_flat.T, input_flat)
+    slot["B"].addmm_(grad_flat.T, grad_flat)
+
+
 def main():
     """
     Command-line utility to precompute cached stats.
@@ -307,8 +358,9 @@ def layer_stats_kfac(
     layer = dict(model.named_modules())[layer_name]
     in_dim, out_dim = get_in_and_out_dim_from_layer(layer, layer_name)
     
-    A = torch.zeros((in_dim, in_dim), dtype=dtype, device=model.device)
-    B = torch.zeros((out_dim, out_dim), dtype=dtype, device=model.device)
+    layer_dev = _module_device(layer)
+    A = torch.zeros((in_dim, in_dim), dtype=dtype, device=layer_dev)
+    B = torch.zeros((out_dim, out_dim), dtype=dtype, device=layer_dev)
     N = 0
     total_tokens = 0
     
@@ -358,7 +410,7 @@ def layer_stats_kfac(
     with torch.enable_grad():
         for batch_group in progress(loader, total=batch_count):
             for batch in batch_group:
-                batch = dict_to_(batch, model.device)
+                batch = dict_to_(batch, _embed_device(model))
                 labels = batch['input_ids'].clone()
                 labels[labels == 0] = -100
                 labels[labels == tokenizer.pad_token_id] = -100
@@ -369,7 +421,7 @@ def layer_stats_kfac(
 
                 
                 shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = labels[..., 1:].contiguous()
+                shift_labels = _shift_labels_on_logits_device(labels, shift_logits)
                 
                 loss = torch.nn.functional.cross_entropy(
                     shift_logits.view(-1, shift_logits.size(-1)),
@@ -380,25 +432,18 @@ def layer_stats_kfac(
                 loss.backward()
                 
                 with torch.no_grad():
-                    feat_in = captured_input.detach().to(model.device)
-                    grad_out = captured_grad_output.detach().to(model.device)
-
-                    feat_in = feat_in[:, :-1, :] 
-                    grad_out = grad_out[:, :-1, :]
-
-                    valid_mask = (shift_labels != -100) # Shape: (Batch, Seq_Len-1)
-                    
-                    input_flat = feat_in[valid_mask].to(dtype=dtype)       # (N_valid, Dim_in)
-                    grad_flat = grad_out[valid_mask].to(dtype=dtype)       # (N_valid, Dim_out)
-
-                    A.addmm_(input_flat.T, input_flat)
-                    B.addmm_(grad_flat.T, grad_flat)
-                    
-                    current_valid_tokens = input_flat.shape[0]
-                    total_tokens += current_valid_tokens
+                    valid_mask = (shift_labels != -100)
+                    slot = {"A": A, "B": B}
+                    _kfac_accumulate(
+                        slot,
+                        captured_input.detach(),
+                        captured_grad_output.detach(),
+                        valid_mask,
+                        dtype,
+                    )
+                    A, B = slot["A"], slot["B"]
+                    total_tokens += int(valid_mask.sum().item())
                     N += batch['input_ids'].size(0)
-
-                    del feat_in, grad_out, input_flat, grad_flat
                 
                 if sample_size is not None and N >= sample_size:
                     break
@@ -420,7 +465,6 @@ def layer_stats_kfac(
     for name, param in model.named_parameters():
         param.requires_grad = grads[name]
         
-    A, B = A.to(model.device), B.to(model.device)
     return A, B
 
 def layer_stats_kfac_one_pass(
@@ -515,8 +559,8 @@ def layer_stats_kfac_one_pass(
         # Init A and B
         in_dim, out_dim = get_in_and_out_dim_from_layer(module, target_name)
         matrices[layer_name] = {
-            "A": torch.zeros((in_dim, in_dim), dtype=dtype, device=model.device),
-            "B": torch.zeros((out_dim, out_dim), dtype=dtype, device=model.device)
+            "A": torch.zeros((in_dim, in_dim), dtype=dtype, device=_module_device(module)),
+            "B": torch.zeros((out_dim, out_dim), dtype=dtype, device=_module_device(module)),
         }
         
         # Register Hook
@@ -554,7 +598,7 @@ def layer_stats_kfac_one_pass(
     with torch.enable_grad():
         for batch_group in progress(loader, total=batch_count):
             for batch in batch_group:
-                batch = dict_to_(batch, model.device)
+                batch = dict_to_(batch, _embed_device(model))
                 labels = batch['input_ids'].clone()
                 labels[labels == 0] = -100
                 labels[labels == tokenizer.pad_token_id] = -100
@@ -564,7 +608,7 @@ def layer_stats_kfac_one_pass(
                 logits = outputs.logits if hasattr(outputs, 'logits') else outputs
 
                 shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = labels[..., 1:].contiguous()
+                shift_labels = _shift_labels_on_logits_device(labels, shift_logits)
                 
                 loss = torch.nn.functional.cross_entropy(
                     shift_logits.view(-1, shift_logits.size(-1)),
@@ -587,19 +631,13 @@ def layer_stats_kfac_one_pass(
                     for layer_name in missing_layers:
                         if layer_name not in captured_inputs or layer_name not in captured_grads:
                             continue
-                        
-                        feat_in = captured_inputs[layer_name].to(model.device)
-                        grad_out = captured_grads[layer_name].to(model.device)
-                        
-                        # Truncate to match valid mask logic (seq_len - 1)
-                        feat_in = feat_in[:, :-1, :]
-                        grad_out = grad_out[:, :-1, :]
-
-                        input_flat = feat_in[valid_mask].to(dtype=dtype)
-                        grad_flat = grad_out[valid_mask].to(dtype=dtype)
-                        
-                        matrices[layer_name]["A"].addmm_(input_flat.T, input_flat)
-                        matrices[layer_name]["B"].addmm_(grad_flat.T, grad_flat)
+                        _kfac_accumulate(
+                            matrices[layer_name],
+                            captured_inputs[layer_name],
+                            captured_grads[layer_name],
+                            valid_mask,
+                            dtype,
+                        )
 
                         # if A or B has null, breakpoint
                         if torch.any(torch.isnan(matrices[layer_name]["A"])) or torch.any(torch.isinf(matrices[layer_name]["A"])):
@@ -688,8 +726,8 @@ def layer_stats_kfac_with_txt_tgt_old(
 
         in_dim, out_dim = get_in_and_out_dim_from_layer(module, target_name)
         layer_to_cov_cache[layer_name] = {
-            "A": torch.zeros((in_dim, in_dim), dtype=dtype, device=model.device),
-            "B": torch.zeros((out_dim, out_dim), dtype=dtype, device=model.device)
+            "A": torch.zeros((in_dim, in_dim), dtype=dtype, device=_module_device(module)),
+            "B": torch.zeros((out_dim, out_dim), dtype=dtype, device=_module_device(module)),
         }
         
         handles.append(module.register_forward_hook(get_hook(layer_name)))
@@ -707,7 +745,7 @@ def layer_stats_kfac_with_txt_tgt_old(
         # possibly the worst code i've ever written in a while...
         for txt_edit, tgt_edit in tqdm(zip(chunks(txt_eval, batch_size), chunks(tgt_eval, batch_size)), total=len(txt_eval)//batch_size):
             inputs_targets = [txt_ + tgt_ for txt_, tgt_ in zip(txt_edit, tgt_edit)]
-            encodings = tokenizer(inputs_targets, return_tensors="pt", padding=True).to(model.device)
+            encodings = tokenizer(inputs_targets, return_tensors="pt", padding=True).to(_embed_device(model))
             labels = encodings["input_ids"].clone()
             attention_mask = encodings["attention_mask"]
             
@@ -726,7 +764,7 @@ def layer_stats_kfac_with_txt_tgt_old(
             logits = outputs.logits if hasattr(outputs, 'logits') else outputs
 
             shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
+            shift_labels = _shift_labels_on_logits_device(labels, shift_logits)
 
             loss = torch.nn.functional.cross_entropy(
                 shift_logits.view(-1, shift_logits.size(-1)),
@@ -749,18 +787,13 @@ def layer_stats_kfac_with_txt_tgt_old(
                 for layer_name in layer_names:
                     if layer_name not in captured_inputs or layer_name not in captured_grads:
                         continue
-
-                    feat_in = captured_inputs[layer_name].to(model.device)
-                    grad_out = captured_grads[layer_name].to(model.device)
-
-                    # Truncate to match valid mask logic (seq_len - 1)
-                    feat_in = feat_in[:, :-1, :]
-                    grad_out = grad_out[:, :-1, :]
-                    kfac_dtype = layer_to_cov_cache[layer_name]["A"].dtype
-                    input_flat = feat_in[valid_mask].to(dtype=kfac_dtype)
-                    grad_flat = grad_out[valid_mask].to(dtype=kfac_dtype)
-                    layer_to_cov_cache[layer_name]["A"].addmm_(input_flat.T, input_flat)
-                    layer_to_cov_cache[layer_name]["B"].addmm_(grad_flat.T, grad_flat)
+                    _kfac_accumulate(
+                        layer_to_cov_cache[layer_name],
+                        captured_inputs[layer_name],
+                        captured_grads[layer_name],
+                        valid_mask,
+                        layer_to_cov_cache[layer_name]["A"].dtype,
+                    )
                     # print(f"Layer {layer_name}: Added {input_flat.shape[0]} tokens to KFAC computation. trace of B is now {torch.trace(layer_to_cov_cache[layer_name]['B']).item()}")
                 # Update counters (only once per batch)
                 total_tokens += current_valid_tokens
@@ -865,8 +898,8 @@ def layer_stats_kfac_with_txt_tgt(
 
         in_dim, out_dim = get_in_and_out_dim_from_layer(module, target_name)
         layer_to_cov_cache[layer_name] = {
-            "A": torch.zeros((in_dim, in_dim), dtype=dtype, device=model.device),
-            "B": torch.zeros((out_dim, out_dim), dtype=dtype, device=model.device)
+            "A": torch.zeros((in_dim, in_dim), dtype=dtype, device=_module_device(module)),
+            "B": torch.zeros((out_dim, out_dim), dtype=dtype, device=_module_device(module)),
         }
         
         handles.append(module.register_forward_hook(get_hook(layer_name)))
@@ -897,7 +930,7 @@ def layer_stats_kfac_with_txt_tgt(
     with torch.enable_grad():
         for batch_group in progress(loader, total=batch_count):
             for batch in batch_group:
-                batch = dict_to_(batch, model.device)
+                batch = dict_to_(batch, _embed_device(model))
                 labels = batch['input_ids'].clone()
                 labels[labels == 0] = -100
                 labels[labels == tokenizer.pad_token_id] = -100
@@ -907,7 +940,7 @@ def layer_stats_kfac_with_txt_tgt(
                 logits = outputs.logits if hasattr(outputs, 'logits') else outputs
 
                 shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = labels[..., 1:].contiguous()
+                shift_labels = _shift_labels_on_logits_device(labels, shift_logits)
                 
                 loss = torch.nn.functional.cross_entropy(
                     shift_logits.view(-1, shift_logits.size(-1)),
@@ -926,18 +959,13 @@ def layer_stats_kfac_with_txt_tgt(
                     for layer_name in layer_names:
                         if layer_name not in captured_inputs or layer_name not in captured_grads:
                             continue
-
-                        feat_in = captured_inputs[layer_name].to(model.device)
-                        grad_out = captured_grads[layer_name].to(model.device)
-
-                        # Truncate to match valid mask logic (seq_len - 1)
-                        feat_in = feat_in[:, :-1, :]
-                        grad_out = grad_out[:, :-1, :]
-                        kfac_dtype = layer_to_cov_cache[layer_name]["A"].dtype
-                        input_flat = feat_in[valid_mask].to(dtype=kfac_dtype)
-                        grad_flat = grad_out[valid_mask].to(dtype=kfac_dtype)
-                        layer_to_cov_cache[layer_name]["A"].addmm_(input_flat.T, input_flat)
-                        layer_to_cov_cache[layer_name]["B"].addmm_(grad_flat.T, grad_flat)
+                        _kfac_accumulate(
+                            layer_to_cov_cache[layer_name],
+                            captured_inputs[layer_name],
+                            captured_grads[layer_name],
+                            valid_mask,
+                            layer_to_cov_cache[layer_name]["A"].dtype,
+                        )
                 
                 total_tokens += current_valid_tokens
 
@@ -1018,8 +1046,8 @@ def layer_stats_kfac_fisher_with_txt_tgt(
                 raise ValueError(f"Could not determine dims for {layer_name}")
 
         layer_to_cov_cache[layer_name] = {
-            "A": torch.zeros((in_dim, in_dim), dtype=dtype, device=model.device),
-            "B": torch.zeros((out_dim, out_dim), dtype=dtype, device=model.device)
+            "A": torch.zeros((in_dim, in_dim), dtype=dtype, device=_module_device(module)),
+            "B": torch.zeros((out_dim, out_dim), dtype=dtype, device=_module_device(module)),
         }
         
         handles.append(module.register_forward_hook(get_hook(layer_name)))
@@ -1035,7 +1063,7 @@ def layer_stats_kfac_fisher_with_txt_tgt(
     with torch.enable_grad():
         for txt_edit, tgt_edit in tqdm(zip(chunks(txt_eval, batch_size), chunks(tgt_eval, batch_size)), total=len(txt_eval)//batch_size):
             inputs_targets = [txt_ + tgt_ for txt_, tgt_ in zip(txt_edit, tgt_edit)]
-            encodings = tokenizer(inputs_targets, return_tensors="pt", padding=True).to(model.device)
+            encodings = tokenizer(inputs_targets, return_tensors="pt", padding=True).to(_embed_device(model))
             labels = encodings["input_ids"].clone()
             
             # Masking setup
@@ -1051,7 +1079,7 @@ def layer_stats_kfac_fisher_with_txt_tgt(
             logits = outputs.logits if hasattr(outputs, 'logits') else outputs
 
             shift_logits = logits[..., :-1, :].contiguous() # [B, Seq-1, Vocab]
-            shift_labels = labels[..., 1:].contiguous()     # [B, Seq-1]
+            shift_labels = _shift_labels_on_logits_device(labels, shift_logits)     # [B, Seq-1]
 
             scaled_logits = shift_logits / temperature
             probs = torch.nn.functional.softmax(scaled_logits, dim=-1) # [B, S, V]
@@ -1078,20 +1106,13 @@ def layer_stats_kfac_fisher_with_txt_tgt(
                 for layer_name in layer_names:
                     if layer_name not in captured_inputs or layer_name not in captured_grads:
                         continue
-
-                    feat_in = captured_inputs[layer_name].to(model.device)
-                    grad_out = captured_grads[layer_name].to(model.device)
-
-                    # Truncate to match valid mask logic (seq_len - 1)
-                    feat_in = feat_in[:, :-1, :]
-                    grad_out = grad_out[:, :-1, :]
-                    kfac_dtype = layer_to_cov_cache[layer_name]["A"].dtype
-                    
-                    input_flat = feat_in[valid_mask].to(dtype=kfac_dtype)
-                    grad_flat = grad_out[valid_mask].to(dtype=kfac_dtype)
-                    
-                    layer_to_cov_cache[layer_name]["A"].addmm_(input_flat.T, input_flat)
-                    layer_to_cov_cache[layer_name]["B"].addmm_(grad_flat.T, grad_flat)
+                    _kfac_accumulate(
+                        layer_to_cov_cache[layer_name],
+                        captured_inputs[layer_name],
+                        captured_grads[layer_name],
+                        valid_mask,
+                        layer_to_cov_cache[layer_name]["A"].dtype,
+                    )
 
                 # Update counters
                 total_tokens += current_valid_tokens
@@ -1133,7 +1154,7 @@ def calculate_request_loss(model, tokenizer, txt, tgt, sample_size=1):
     with torch.no_grad():
         for txt_edit, tgt_edit in tqdm(zip(chunks(txt_eval, batch_size), chunks(tgt_eval, batch_size)), total=len(txt_eval)//batch_size, disable=sample_size < 50):
             inputs_targets = [t + g for t, g in zip(txt_edit, tgt_edit)]
-            encodings = tokenizer(inputs_targets, return_tensors="pt", padding=True).to(model.device)
+            encodings = tokenizer(inputs_targets, return_tensors="pt", padding=True).to(_embed_device(model))
             
             labels = encodings["input_ids"].clone()
             
@@ -1147,7 +1168,7 @@ def calculate_request_loss(model, tokenizer, txt, tgt, sample_size=1):
             logits = outputs.logits
 
             shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
+            shift_labels = _shift_labels_on_logits_device(labels, shift_logits)
 
             loss = torch.nn.functional.cross_entropy(
                 shift_logits.view(-1, shift_logits.size(-1)),
@@ -1230,7 +1251,7 @@ def calculate_cache_loss(
     with torch.no_grad():
         for batch_group in progress(loader, total=batch_count):
             for batch in batch_group:
-                batch = dict_to_(batch, model.device)
+                batch = dict_to_(batch, _embed_device(model))
                 
                 labels = batch['input_ids'].clone()
                 labels[labels == 0] = -100
@@ -1242,7 +1263,7 @@ def calculate_cache_loss(
                 
                 # Shift so that tokens < n predict n
                 shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = labels[..., 1:].contiguous()
+                shift_labels = _shift_labels_on_logits_device(labels, shift_logits)
                 
                 loss = torch.nn.functional.cross_entropy(
                     shift_logits.view(-1, shift_logits.size(-1)),
