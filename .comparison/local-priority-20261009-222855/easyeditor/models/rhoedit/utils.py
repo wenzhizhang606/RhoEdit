@@ -1,0 +1,900 @@
+import gc
+import os
+from copy import deepcopy
+from typing import Any, Dict, List, Optional, Tuple
+
+import torch
+import random
+from dotenv import load_dotenv
+from tqdm import trange
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from .projected_adam import  ProjectedAdam
+from ..rome.layer_stats import (
+    calculate_cache_loss,
+    calculate_request_loss,
+    layer_stats_kfac_one_pass,
+    layer_stats_kfac_with_txt_tgt,
+)
+from .RhoEdit_hparams import AdamHyperParams
+from .seq_tracker import CAP_LOSS_KEY, cov_cache_nbytes
+from easyeditor.tools import ExperimentTracker
+
+load_dotenv()
+STATS_DIR = os.getenv("STATS_DIR")
+
+# Only used when loading K-FAC stats. Edit JSON loading stays in the root utils.py.
+KFAC_DATASET_ALIASES = {
+    "zsre": "zsre_mend_3k",
+    "zsre3k": "zsre_mend_3k",
+    "zsre_3k": "zsre_mend_3k",
+    "zsre10k": "zsre_mend_10k",
+    "zsre163k": "zsre_mend_163k",
+    "counterfact": "counterfact-edit_3k",
+    "wiki": "wiki_big_edit_3k",
+}
+
+
+def normalize_kfac_dataset(ds_name):
+    if not ds_name:
+        return ds_name
+    return KFAC_DATASET_ALIASES.get(str(ds_name).lower(), ds_name)
+
+
+def _is_llama_or_phi(model_name: str) -> bool:
+    lower = str(model_name).lower()
+    return "llama" in lower or "phi" in lower or "qwen" in lower
+
+
+def _model_device(model) -> torch.device:
+    return getattr(model, "device", next(model.parameters()).device)
+
+
+def _layer_names(hparams) -> List[str]:
+    return [hparams.rewrite_module_tmp.format(layer) for layer in hparams.layers]
+
+
+def _cache_dtype_name(hparams) -> str:
+    return getattr(hparams, "mom2_n_dtype", getattr(hparams, "mom2_dtype", "float32"))
+
+
+def _cache_sample_size(hparams) -> int:
+    return int(getattr(hparams, "mom2_n_sample", getattr(hparams, "mom2_n_samples", 10000)))
+
+
+def _build_cov_cache_from_hparams(
+    model: AutoModelForCausalLM,
+    tok: AutoTokenizer,
+    hparams,
+    force_recompute: bool = False,
+) -> Dict[str, Dict]:
+    layer_names = _layer_names(hparams)
+    dtype_name = _cache_dtype_name(hparams)
+    sample_size = _cache_sample_size(hparams)
+
+    raw_task_dataset = getattr(hparams, "task_mom2_dataset", None)
+    task_mom2_dataset = normalize_kfac_dataset(raw_task_dataset)
+    task_sample_size= getattr(hparams, "task_mom2_n_samples", None)
+    if raw_task_dataset and task_mom2_dataset != raw_task_dataset:
+        print(f"[RhoEdit] K-FAC task dataset {raw_task_dataset} -> {task_mom2_dataset}")
+    print("[RhoEdit] Computing/loading base KFAC stats.")
+    stats_dict = layer_stats_kfac_one_pass(
+        model=model,
+        tokenizer=tok,
+        layer_names=layer_names,
+        stats_dir=STATS_DIR,
+        ds_name=hparams.mom2_dataset,
+        to_collect=["mom2"],
+        sample_size=sample_size if not force_recompute else sample_size,
+        precision=dtype_name,
+        force_recompute=force_recompute
+    )
+
+    task_stats_dict=None
+    if task_mom2_dataset is not None:
+        print("[RhoEdit] Computing/loading task KFAC stats.")
+        task_stats_dict = layer_stats_kfac_one_pass(
+        model=model,
+        tokenizer=tok,
+        layer_names=layer_names,
+        stats_dir=STATS_DIR,
+        ds_name=task_mom2_dataset,
+        to_collect=["mom2"],
+        sample_size=task_sample_size if not force_recompute else task_sample_size,
+        precision=dtype_name,
+        force_recompute=force_recompute
+    )
+
+    layer_to_cov_cache = {}
+    for layer_name, (A, B, n) in stats_dict.items():
+        cov_cache = {
+            "A": A.to("cpu", dtype=torch.float32),
+            "B": B.to("cpu", dtype=torch.float32),
+            "num_samples": n,
+        }
+        if task_stats_dict is not None and layer_name in task_stats_dict:
+            task_A, task_B, task_n = task_stats_dict[layer_name]
+            cov_cache.update(
+                {
+                    "task_A": task_A.to("cpu", dtype=torch.float32),
+                    "task_B": task_B.to("cpu", dtype=torch.float32),
+                    "task_num_samples": task_n,
+                }
+            )
+        layer_to_cov_cache[layer_name] = cov_cache
+    return layer_to_cov_cache
+
+
+def _to_cpu_float32(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor.to("cpu", dtype=torch.float32).contiguous()
+
+
+def calculate_projection_cache_with_kfac(A, B):
+    return {
+        "A": _to_cpu_float32(A),
+        "B": _to_cpu_float32(B),
+    }
+
+
+def get_weights(
+    model: AutoModelForCausalLM,
+    hparams: AdamHyperParams,
+    to_cpu: bool = False,
+) -> Dict[str, torch.Tensor]:
+    return {
+        n: (p.detach().cpu().clone() if to_cpu else p)
+        for n, p in model.named_parameters()
+        for layer in hparams.layers
+        if hparams.rewrite_module_tmp.format(layer) in n and "bias" not in n
+    }
+
+
+def calculate_cov_cache_with_old_data(model, tok, hparams, force_recompute=False) -> Dict[str, Dict]:
+    return _build_cov_cache_from_hparams(model, tok, hparams, force_recompute)
+
+
+def calculate_cov_cache_with_request(
+    txt,
+    tgt,
+    model,
+    tok,
+    hparams,
+    add_pretrain_data: Optional[bool] = None,
+    sample_size: Optional[int] = None,
+):
+    if add_pretrain_data is None:
+        add_pretrain_data = getattr(hparams, "edit_cache_style", "new") == "mix"
+    if sample_size is None:
+        sample_size = getattr(hparams, "edit_n_samples", 10)
+    cov_stats_dict = layer_stats_kfac_with_txt_tgt(
+        model,
+        tok,
+        layer_names=_layer_names(hparams),
+        txt=txt,
+        tgt=tgt,
+        precision=hparams.mom2_dtype,
+        sample_size=sample_size,
+        to_collect=["mom2"],
+        add_pretrain_data=add_pretrain_data,
+        pretrain_sample_size=hparams.mom2_n_samples,
+    )
+
+    layer_to_cov_cache = {}
+    for layer_name in _layer_names(hparams):
+        A, B, num_samples = cov_stats_dict.pop(layer_name)
+        layer_to_cov_cache[layer_name] = {
+            "A": A.to("cpu", dtype=torch.float32),
+            "B": B.to("cpu", dtype=torch.float32),
+            "num_samples": num_samples,
+        }
+        del A, B
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    return layer_to_cov_cache
+
+
+def cache_weights_to_cpu(weights: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    if not isinstance(weights, dict):
+        raise ValueError("Input must be a dict of tensors.")
+    return {name: param.detach().cpu().clone() for name, param in weights.items()}
+
+
+def is_weights_changed(current_weights, cached_weights, threshold: float) -> bool:
+    for name, param in current_weights.items():
+        cached_param = cached_weights[name]
+        denom = torch.norm(cached_param).clamp(min=1e-8)
+        change = torch.norm(param.detach().cpu() - cached_param) / denom
+        if change > threshold:
+            print(f"Weight {name} changed by {change:.4f}, exceeding threshold {threshold}.")
+            return True
+    return False
+
+
+def recalculate_cov_cache_if_weights_changed(
+    model,
+    tok,
+    hparams,
+    current_weights_cpu,
+    layer_to_cov_cache,
+) -> Tuple[Dict[str, torch.Tensor], Dict[str, Dict], bool]:
+    if (
+        not getattr(hparams, "recalculate_cache", False)
+        or current_weights_cpu is None
+    ):
+        return current_weights_cpu, layer_to_cov_cache, False
+
+    weights = get_weights(model, hparams)
+    threshold = getattr(hparams, "recalculate_weight_threshold", 0.01)
+    if not is_weights_changed(weights, current_weights_cpu, threshold):
+        return current_weights_cpu, layer_to_cov_cache, False
+
+    del layer_to_cov_cache, weights
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    layer_to_cov_cache = calculate_cov_cache_with_old_data(
+        model, tok, hparams, force_recompute=True
+    )
+    weights = get_weights(model, hparams)
+    current_weights_cpu = cache_weights_to_cpu(weights)
+    return current_weights_cpu, layer_to_cov_cache, True
+
+
+def calculate_old_loss(model, tok, hparams):
+    if getattr(hparams, "disable_old_loss_check", False):
+        return {}
+    with torch.no_grad():
+        old_task_loss = calculate_cache_loss(
+            model,
+            tok,
+            hparams.mom2_dataset,
+            sample_size=100,
+        )
+    return {"General capabilities of the model Loss": old_task_loss}
+
+
+def calculate_old_edit_loss(txt_chunks, tgt_chunks, model, tok):
+    if len(txt_chunks) == 0:
+        return {}
+
+    mets = {}
+    with torch.no_grad():
+        for i, (txt, tgt) in enumerate(zip(txt_chunks, tgt_chunks)):
+            request_loss = calculate_request_loss(model, tok, txt, tgt, sample_size=10)
+            mets.update({f"OLD_EDIT_LOSS/Old Edit Loss Chunk {i}": request_loss})
+    avg_loss = sum(mets.values()) / len(mets)
+    mets.update({"Task 2 Loss": avg_loss})
+    return mets
+
+
+def _valid_cov_caches(layer_to_cov_caches: Optional[List[Dict[str, Dict]]]) -> List[Dict[str, Dict]]:
+    if not layer_to_cov_caches:
+        return []
+    return [cache for cache in layer_to_cov_caches if cache]
+
+
+def build_optimizer_with_cov_caches(
+    model,
+    hparams,
+    layer_to_cov_caches: List[Dict[str, Dict]],
+    opt=None,
+):
+    valid_caches = _valid_cov_caches(layer_to_cov_caches)
+    if valid_caches:
+        combined_layer_to_cov_cache = combine_layer_to_cov_caches(valid_caches)
+        weight_to_projection_cache = calculate_projection_caches_from_cov_caches(
+            model,
+            hparams,
+            combined_layer_to_cov_cache,
+        )
+    else:
+        weight_to_projection_cache = {}
+
+    if opt is not None:
+        opt.reset_cache(weight_to_projection_cache)
+        return opt
+
+    weights = get_weights(model, hparams)
+    return ProjectedAdam(
+        [v for _, v in weights.items()],
+        projection_cache_map=weight_to_projection_cache,
+        soft_lambda=getattr(hparams, "soft_lambda", 1.0),
+        factor_damping=getattr(hparams, "newton_damping", 1e-5),
+        factor_device=getattr(hparams, "factor_device", "auto"),
+        lr=hparams.lr,
+        weight_decay=hparams.weight_decay,
+    )
+
+
+def combine_layer_to_cov_caches(
+    layer_to_cov_caches: List[Dict[str, Dict]],
+) -> Dict[str, Dict]:
+    layer_to_cov_caches = _valid_cov_caches(layer_to_cov_caches)
+    if len(layer_to_cov_caches) == 0:
+        return {}
+    if len(layer_to_cov_caches) == 1:
+        return layer_to_cov_caches[0]
+
+    combined_layer_to_cov_caches = {}
+    for layer_name in layer_to_cov_caches[0].keys():
+        A_list = [layer_to_cov[layer_name]["A"] for layer_to_cov in layer_to_cov_caches]
+        B_list = [layer_to_cov[layer_name]["B"] for layer_to_cov in layer_to_cov_caches]
+        num_samples_list = [
+            max(int(layer_to_cov[layer_name].get("num_samples", 0)), 1)
+            for layer_to_cov in layer_to_cov_caches
+        ]
+        total_samples = sum(num_samples_list)
+
+        combined_A = sum(
+            A * num_sample for A, num_sample in zip(A_list, num_samples_list)
+        ) / total_samples
+        combined_B = sum(
+            B * num_sample for B, num_sample in zip(B_list, num_samples_list)
+        ) / total_samples
+
+        combined_layer_to_cov_caches[layer_name] = {
+            "A": combined_A,
+            "B": combined_B,
+            "num_samples": total_samples,
+        }
+        task_caches = [
+            layer_to_cov[layer_name]
+            for layer_to_cov in layer_to_cov_caches
+            if "task_A" in layer_to_cov[layer_name] and "task_B" in layer_to_cov[layer_name]
+        ]
+        if task_caches:
+            task_A_list = [cache["task_A"] for cache in task_caches]
+            task_B_list = [cache["task_B"] for cache in task_caches]
+            task_num_samples_list = [
+                max(int(cache.get("task_num_samples", cache.get("num_samples", 0))), 1)
+                for cache in task_caches
+            ]
+            task_total_samples = sum(task_num_samples_list)
+            combined_layer_to_cov_caches[layer_name].update(
+                {
+                    "task_A": sum(
+                        A * num_sample
+                        for A, num_sample in zip(task_A_list, task_num_samples_list)
+                    ) / task_total_samples,
+                    "task_B": sum(
+                        B * num_sample
+                        for B, num_sample in zip(task_B_list, task_num_samples_list)
+                    ) / task_total_samples,
+                    "task_num_samples": task_total_samples,
+                }
+            )
+    print(f"Combined samples {num_samples_list}")
+    return combined_layer_to_cov_caches
+
+
+def attach_task_factors(
+    cap_caches: Optional[Dict[str, Dict]],
+    source_caches: Optional[Dict[str, Dict]],
+) -> Optional[Dict[str, Dict]]:
+    """Copy edit/task K-FAC factors onto a cap cache without blending A/B."""
+    if not cap_caches or not source_caches:
+        return cap_caches
+    for layer_name, cap_cache in cap_caches.items():
+        source = source_caches.get(layer_name)
+        if source is None or "task_A" not in source or "task_B" not in source:
+            continue
+        cap_cache["task_A"] = source["task_A"]
+        cap_cache["task_B"] = source["task_B"]
+        if "task_num_samples" in source:
+            cap_cache["task_num_samples"] = source["task_num_samples"]
+    return cap_caches
+
+
+def estimate_chunk_kfac(txt, tgt, model, tok, hparams) -> Dict[str, Dict]:
+    """Estimate K-FAC on the current edit chunk only. No wiki mix, no subsample."""
+    return calculate_cov_cache_with_request(
+        txt,
+        tgt,
+        model,
+        tok,
+        hparams,
+        add_pretrain_data=False,
+        sample_size=len(txt),
+    )
+
+
+def _with_sample_count(caches: Dict[str, Dict], n: int) -> Dict[str, Dict]:
+    """Copy A/B and set the Algorithm-1 mix weight (M or T), dropping task factors."""
+    n = max(int(n), 1)
+    return {
+        layer_name: {
+            "A": cache["A"],
+            "B": cache["B"],
+            "num_samples": n,
+        }
+        for layer_name, cache in caches.items()
+    }
+
+
+def _with_token_count(caches: Dict[str, Dict]) -> Dict[str, Dict]:
+    """Copy A/B and keep the token count the K-FAC pass stored in ``num_samples``.
+
+    Both ``layer_stats_kfac_one_pass`` (Wikipedia) and
+    ``layer_stats_kfac_with_txt_tgt`` (edit chunks) return ``total_tokens`` as the
+    third element, so the mix weight becomes the number of tokens that entered
+    each per-token-averaged A/B instead of the number of documents/requests.
+    """
+    return {
+        layer_name: {
+            "A": cache["A"],
+            "B": cache["B"],
+            "num_samples": max(int(cache.get("num_samples", 0)), 1),
+        }
+        for layer_name, cache in caches.items()
+    }
+
+
+def _retention_weight_mode(hparams) -> str:
+    mode = str(getattr(hparams, "retention_weight", "samples") or "samples").lower()
+    if mode not in ("samples", "tokens"):
+        raise ValueError(f"retention_weight must be 'samples' or 'tokens', got {mode!r}")
+    return mode
+
+
+def pair_retention_with_edit(
+    retention: Dict[str, Dict],
+    edit_cache: Dict[str, Dict],
+) -> Dict[str, Dict]:
+    """Pair retention-side (A, B) with current-chunk edit-side (task_A, task_B)."""
+    paired = {}
+    for layer_name, ret in retention.items():
+        edit = edit_cache[layer_name]
+        paired[layer_name] = {
+            "A": ret["A"],
+            "B": ret["B"],
+            "num_samples": max(int(ret.get("num_samples", 0)), 1),
+            "task_A": edit["A"],
+            "task_B": edit["B"],
+            "task_num_samples": max(int(edit.get("num_samples", 0)), 1),
+        }
+    return paired
+
+
+def update_retention_eq13(
+    retention: Dict[str, Dict],
+    new_chunk_cache: Dict[str, Dict],
+    t_k: int,
+    weight_mode: str = "samples",
+) -> Dict[str, Dict]:
+    """Algorithm 1 weighted mix of post-update edit factors into retention.
+
+    M_k = M_{k-1} + T_k
+    A_bar_k = (M_{k-1} A_bar_{k-1} + T_k A_k) / M_k
+    where (A_k, B_k) are estimated on theta_k and
+      weight_mode="samples": T_k = |D_edit^{(k)}| (requests in the chunk),
+      weight_mode="tokens":  T_k = tokens that entered (A_k, B_k).
+    """
+    if weight_mode == "tokens":
+        incoming = _with_token_count(new_chunk_cache)
+    else:
+        incoming = _with_sample_count(new_chunk_cache, t_k)
+    return combine_layer_to_cov_caches([retention, incoming])
+
+
+def _retention_sample_count(retention: Dict[str, Dict]) -> int:
+    if not retention:
+        return 0
+    return max(int(next(iter(retention.values())).get("num_samples", 0)), 0)
+
+
+def _find_weight_for_layer(weights: Dict[str, torch.Tensor], layer_name: str):
+    if layer_name in weights:
+        return weights[layer_name]
+
+    clean = layer_name[:-len(".weight")] if layer_name.endswith(".weight") else layer_name
+    for weight_name, weight in weights.items():
+        if layer_name in weight_name or clean in weight_name:
+            return weight
+    raise KeyError(f"Could not find trainable weight for layer {layer_name}")
+
+
+def calculate_projection_caches_from_cov_caches(
+    model,
+    hparams,
+    layer_to_cov_caches,
+):
+    weight_to_projection_cache = {}
+    weights = get_weights(model, hparams)
+    device = _model_device(model)
+
+    for layer_name, cov_cache in layer_to_cov_caches.items():
+        A = cov_cache["A"].to(device=device, dtype=torch.float32)
+        B = cov_cache["B"].to(device=device, dtype=torch.float32)
+
+        if not _is_llama_or_phi(hparams.model_name):
+            A, B = B, A
+
+        projection_cache = calculate_projection_cache_with_kfac(
+            A, B
+        )
+        projection_cache.update(
+            {
+                "cap_A": projection_cache["A"],
+                "cap_B": projection_cache["B"],
+            }
+        )
+
+        if "task_A" not in cov_cache or "task_B" not in cov_cache:
+            raise ValueError(
+                f"RhoEdit projection for {layer_name} is missing task_A/task_B. "
+                "Pass the original capability cache, or call attach_task_factors, "
+                "so edit curvature is preserved."
+            )
+        task_A = cov_cache["task_A"].to(device=device, dtype=torch.float32)
+        task_B = cov_cache["task_B"].to(device=device, dtype=torch.float32)
+        task_num_samples = cov_cache.get("task_num_samples")
+
+        if not _is_llama_or_phi(hparams.model_name):
+            task_A, task_B = task_B, task_A
+
+        task_projection_cache = calculate_projection_cache_with_kfac(task_A, task_B)
+        projection_cache.update(
+            {
+                "edit_A": task_projection_cache["A"],
+                "edit_B": task_projection_cache["B"],
+                "task_num_samples": task_num_samples,
+            }
+        )
+        projection_cache["layer_name"] = layer_name
+        weight_to_projection_cache[_find_weight_for_layer(weights, layer_name)] = projection_cache
+
+        del A, B, task_A, task_B
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    return weight_to_projection_cache
+
+
+def update_model_and_tokenizer_with_appropriate_padding_token(model, tokenizer, hparams):
+    if "Qwen" in hparams.model_name:
+        tokenizer.pad_token = tokenizer.eos_token
+        model.config.pad_token_id = tokenizer.eos_token_id
+    else:
+        tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+        model.resize_token_embeddings(len(tokenizer), mean_resizing=False)
+        model.config.pad_token_id = tokenizer.pad_token_id
+    return model, tokenizer
+
+
+def setup_requests_for_safeedit(requests: List[Dict]) -> List[Dict]:
+    """Adapt SafeEdit records to the prompt/target format used by RhoEdit."""
+    if not requests:
+        return []
+    if "target_new" in requests[0]:
+        return requests
+
+    return [
+        {
+            "prompt": request["question"],
+            "target_new": request["target_unsafe"],
+        }
+        for request in requests
+    ]
+
+def chunks(arr, n):
+    """Yield successive n-sized chunks from arr."""
+    chunk = []
+    for a in arr:
+        chunk.append(a)
+        if len(chunk) == n:
+            yield chunk
+            chunk = []
+    if len(chunk) > 0:
+        yield chunk
+
+class AverageMeter:
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
+        
+def execute_sft_adam(
+    model: AutoModelForCausalLM,
+    tok: AutoTokenizer,
+    requests: List[Dict],
+    hparams: AdamHyperParams,
+    **kwargs: Any,
+) -> AutoModelForCausalLM:
+    print("[execute_sft_adam]Enter the function")
+    device = model.device
+    if tok.padding_side != "right":
+        tok.padding_side = "right"
+    
+    requests = deepcopy(requests)
+    for i, request in enumerate(requests):
+        if request["target_new"] and request["target_new"][0] != " ":
+            requests[i]["target_new"] = " " + request["target_new"]
+    
+    layer_to_cov_cache_old = calculate_cov_cache_with_old_data(
+        model, tok, hparams, force_recompute=False
+    )
+    
+    opt = build_optimizer_with_cov_caches(model, hparams, [layer_to_cov_cache_old])
+    weights = get_weights(model, hparams)
+    current_weights_cpu = cache_weights_to_cpu(weights)
+    for name, w in model.named_parameters():
+        w.requires_grad = name in weights
+
+    old_loss = calculate_old_loss(model, tok, hparams)
+    ExperimentTracker.log(old_loss)
+    loss_meter = AverageMeter()
+    pbar = trange(hparams.num_steps)
+    print("[execute_sft_adam]Start training\n")
+    for it in pbar:
+        loss_meter.reset()
+
+        random.shuffle(requests)
+        texts = [r["prompt"] for r in requests]
+        targets = [r["target_new"] for r in requests]
+
+        # split into batches
+        for txt, tgt in zip(
+            chunks(texts, hparams.batch_size), chunks(targets, hparams.batch_size)
+        ):
+            inputs_targets = [txt_ + tgt_ for txt_, tgt_ in zip(txt, tgt)]
+            encodings = tok(inputs_targets, return_tensors="pt", padding=True, truncation=True, max_length=hparams.max_length).to(device)
+            labels = encodings["input_ids"].clone()
+
+            labels[labels == tok.pad_token_id] = -100
+            for i, prompt in enumerate(txt):
+                prompt_len = len(tok(prompt, add_special_tokens=True, truncation=True, max_length=hparams.max_length)["input_ids"])
+                labels[i, :prompt_len] = -100
+            opt.zero_grad(set_to_none=True)
+            outputs = model(**encodings, labels=labels)
+            loss = outputs.loss
+                
+            loss_meter.update(loss.item(), n=labels.size(0))
+            if loss.item() >= 1e-2:
+                loss.backward()
+                opt.step()
+                current_weights_cpu, layer_to_cov_cache_old, should_recalculate = recalculate_cov_cache_if_weights_changed(
+                    model,
+                    tok,
+                    hparams,
+                    current_weights_cpu,
+                    layer_to_cov_cache_old,
+                )
+                if should_recalculate:
+                    opt = build_optimizer_with_cov_caches(model, hparams, [layer_to_cov_cache_old], opt=opt)
+        metrics =calculate_old_loss(model, tok, hparams)
+        metrics.update({"FT Loss": loss_meter.avg})
+        ExperimentTracker.log(metrics)
+        
+        pbar.write(f"FT Loss: {loss_meter.avg:.4f}")
+        pbar.set_postfix({"loss": f"{loss_meter.avg:.4f}"})
+
+        if loss_meter.avg < 1e-2:
+            break
+    
+    return model
+
+def execute_sft_adam_sequential(
+    model: AutoModelForCausalLM,
+    tok: AutoTokenizer,
+    requests: List[Dict],
+    hparams: AdamHyperParams,
+    tracker=None,
+    **kwargs: Any,
+) -> AutoModelForCausalLM:
+    """Sequential RhoEdit (Algorithm 1 when ``edit_cache_style=sequential``).
+
+    ``tracker`` (SequentialEditTracker) is optional and only adds per-round
+    evaluation/plotting; the edit path is unchanged.
+    """
+    device = model.device
+    cache_style = getattr(hparams, "edit_cache_style", "sequential")
+    
+    if tok.padding_side != "right":
+        tok.padding_side = "right"
+    
+    requests = deepcopy(requests)
+    for i, request in enumerate(requests):
+        if request["target_new"] and request["target_new"][0] != " ":
+            requests[i]["target_new"] = " " + request["target_new"]
+    random.shuffle(requests)
+    texts = [r["prompt"] for r in requests]
+    targets = [r["target_new"] for r in requests]
+    rephrases = [r.get("rephrase_prompt") for r in requests]
+    txt_chunks, tgt_chunks, reph_chunks = [], [], []
+    num_rounds = -(-len(texts) // hparams.num_edits)
+
+
+    layer_to_cov_cache_old = calculate_cov_cache_with_old_data(
+        model, tok, hparams, force_recompute=False
+    )
+    # Algorithm 1: (A_bar_0, B_bar_0, M_0) <- (A_cap, B_cap, N).
+    #   samples: N = |D_cap| documents (cache_sample_num)
+    #   tokens:  N = tokens that entered the Wikipedia K-FAC pass
+    weight_mode = _retention_weight_mode(hparams)
+    if weight_mode == "tokens":
+        retention = _with_token_count(layer_to_cov_cache_old)
+    else:
+        retention = _with_sample_count(
+            layer_to_cov_cache_old, _cache_sample_size(hparams)
+        )
+
+    # mix/disable still train the first chunk with the startup wiki+task pair.
+    # sequential waits until the current-chunk edit factors are estimated.
+    if cache_style == "sequential":
+        print(
+            "[RhoEdit] edit_cache_style=sequential uses Algorithm 1 "
+            f"(post-update mix, weight={weight_mode}, M_0={_retention_sample_count(retention)})."
+        )
+        opt = None
+    else:
+        opt = build_optimizer_with_cov_caches(model, hparams, [layer_to_cov_cache_old])
+    weights = get_weights(model, hparams)
+    current_weights_cpu = cache_weights_to_cpu(weights)
+        
+    for name, w in model.named_parameters():
+        w.requires_grad = name in weights
+
+    old_loss = calculate_old_loss(model, tok, hparams)
+    ExperimentTracker.log(old_loss)
+    if tracker is not None:
+        tracker.set_baseline(old_loss.get(CAP_LOSS_KEY), num_rounds)
+    
+    layer_to_cov_cache_data = None
+    loss_meter = AverageMeter()
+
+    # split into batches
+    for round_idx, (txt_edit, tgt_edit, reph_edit) in enumerate(zip(
+        chunks(texts, hparams.num_edits),
+        chunks(targets, hparams.num_edits),
+        chunks(rephrases, hparams.num_edits),
+    )):
+        if tracker is not None:
+            tracker.begin_round(round_idx)
+        if cache_style == "sequential":
+            print(
+                f"[RhoEdit] Estimate edit-side K-FAC on {len(txt_edit)} "
+                "current-chunk samples at theta_{k-1}."
+            )
+            edit_cache = estimate_chunk_kfac(txt_edit, tgt_edit, model, tok, hparams)
+            paired = pair_retention_with_edit(retention, edit_cache)
+            opt = build_optimizer_with_cov_caches(model, hparams, [paired], opt=opt)
+
+        pbar = trange(hparams.num_steps)
+        for it in pbar:
+            loss_meter.reset()
+            for txt, tgt in zip(
+                chunks(txt_edit, hparams.batch_size), chunks(tgt_edit, hparams.batch_size)
+            ):
+                inputs_targets = [txt_ + tgt_ for txt_, tgt_ in zip(txt, tgt)]
+                encodings = tok(
+                    inputs_targets,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=hparams.max_length,
+                ).to(device)
+
+                labels = encodings["input_ids"].clone()
+
+                labels[labels == tok.pad_token_id] = -100
+                for i, prompt in enumerate(txt):
+                    prompt_len = len(
+                        tok(
+                            prompt,
+                            add_special_tokens=True,
+                            truncation=True,
+                            max_length=hparams.max_length,
+                        )["input_ids"]
+                    )
+                    labels[i, :prompt_len] = -100
+                opt.zero_grad()
+                outputs = model(**encodings, labels=labels)
+                loss = outputs.loss
+
+                if loss.item() >= 1e-2:
+                    loss.backward()
+                    opt.step()
+                    # Algorithm 1 does not recompute wiki/task caches mid-round.
+                    if cache_style == "sequential":
+                        should_recalculate = False
+                    else:
+                        current_weights_cpu, layer_to_cov_cache_old, should_recalculate = recalculate_cov_cache_if_weights_changed(
+                            model,
+                            tok,
+                            hparams,
+                            current_weights_cpu,
+                            layer_to_cov_cache_old,
+                        )
+                    if should_recalculate:                            
+                        if hparams.edit_n_samples > 0 and len(txt_chunks) > 0:
+                            old_txt_list = [item for sublist in txt_chunks for item in sublist]
+                            old_tgt_list = [item for sublist in tgt_chunks for item in sublist]
+
+                            layer_to_cov_cache_data = calculate_cov_cache_with_request(
+                                old_txt_list,
+                                old_tgt_list,
+                                model,
+                                tok,
+                                hparams,
+                            )
+                            opt = build_optimizer_with_cov_caches(model, hparams, [layer_to_cov_cache_old, layer_to_cov_cache_data], opt=opt)
+                        else:
+                            opt = build_optimizer_with_cov_caches(model, hparams, [layer_to_cov_cache_old] if layer_to_cov_cache_data is None else [layer_to_cov_cache_old, layer_to_cov_cache_data], opt=opt)
+                loss_meter.update(loss.item(), n=labels.size(0))
+            pbar.set_postfix({"loss": f"{loss_meter.avg:.4f}"})
+            if loss_meter.avg < 1e-2:
+                break
+        print(f"Loss after editing number of samples {len(txt_edit)}: {loss_meter.avg}")
+        
+        txt_chunks.append(txt_edit)
+        tgt_chunks.append(tgt_edit)
+        reph_chunks.append(reph_edit)
+        # Editor state reported by the tracker (K-FAC factors kept across rounds).
+        state_ref = layer_to_cov_cache_old
+        
+        if cache_style == "sequential":
+            t_k = len(txt_edit)
+            print(
+                f"[RhoEdit] Re-estimate edit K-FAC on {t_k} current-chunk "
+                f"samples at theta_k, then mix into retention (T_k={t_k})."
+            )
+            post_cache = estimate_chunk_kfac(txt_edit, tgt_edit, model, tok, hparams)
+            retention = update_retention_eq13(retention, post_cache, t_k, weight_mode=weight_mode)
+            print(f"[RhoEdit] Retention M_k={_retention_sample_count(retention)} ({weight_mode}).")
+            state_ref = retention
+
+        elif cache_style == "mix":
+            old_txt_list = [item for sublist in txt_chunks for item in sublist]
+            old_tgt_list = [item for sublist in tgt_chunks for item in sublist]
+
+            layer_to_cov_cache_data_pretrain_mix = attach_task_factors(
+                calculate_cov_cache_with_request(
+                    old_txt_list,
+                    old_tgt_list,
+                    model,
+                    tok,
+                    hparams,
+                ),
+                layer_to_cov_cache_old,
+            )
+
+            opt = build_optimizer_with_cov_caches(
+                model, hparams, [layer_to_cov_cache_data_pretrain_mix], opt=opt
+            )
+            state_ref = layer_to_cov_cache_data_pretrain_mix
+        elif cache_style == "disable":
+            print("[RhoEdit] edit_cache_style=disable; projection cache not updated.")
+
+        metrics = calculate_old_loss(model, tok, hparams)
+        old_edit_loss = calculate_old_edit_loss(txt_chunks, tgt_chunks, model, tok)
+        metrics.update(old_edit_loss)
+        metrics.update({"FT Loss": loss_meter.avg})
+        ExperimentTracker.log(metrics)
+
+        if tracker is not None:
+            tracker.end_round(
+                round_idx,
+                model,
+                tok,
+                txt_chunks,
+                tgt_chunks,
+                reph_chunks,
+                state_bytes=cov_cache_nbytes(state_ref),
+                cap_loss=metrics.get(CAP_LOSS_KEY),
+                ft_loss=loss_meter.avg,
+            )
+
+    if tracker is not None:
+        tracker.finalize()
+
+    return model
