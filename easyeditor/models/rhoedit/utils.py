@@ -10,6 +10,11 @@ from tqdm import trange
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .projected_adam import  ProjectedAdam
+from .history_replay import (
+    history_replay_count,
+    sample_history_pairs,
+    validate_history_replay,
+)
 from ..rome.layer_stats import (
     calculate_cache_loss,
     calculate_request_loss,
@@ -67,6 +72,7 @@ def _build_cov_cache_from_hparams(
     tok: AutoTokenizer,
     hparams,
     force_recompute: bool = False,
+    include_task: bool = True,
 ) -> Dict[str, Dict]:
     layer_names = _layer_names(hparams)
     dtype_name = _cache_dtype_name(hparams)
@@ -87,11 +93,12 @@ def _build_cov_cache_from_hparams(
         to_collect=["mom2"],
         sample_size=sample_size if not force_recompute else sample_size,
         precision=dtype_name,
-        force_recompute=force_recompute
+        force_recompute=force_recompute,
+        stats_devices=getattr(hparams, "kfac_stats_devices", "auto_two"),
     )
 
     task_stats_dict=None
-    if task_mom2_dataset is not None:
+    if include_task and task_mom2_dataset is not None:
         print("[RhoEdit] Computing/loading task KFAC stats.")
         task_stats_dict = layer_stats_kfac_one_pass(
         model=model,
@@ -102,7 +109,8 @@ def _build_cov_cache_from_hparams(
         to_collect=["mom2"],
         sample_size=task_sample_size if not force_recompute else task_sample_size,
         precision=dtype_name,
-        force_recompute=force_recompute
+        force_recompute=force_recompute,
+        stats_devices=getattr(hparams, "kfac_stats_devices", "auto_two"),
     )
 
     layer_to_cov_cache = {}
@@ -149,8 +157,8 @@ def get_weights(
     }
 
 
-def calculate_cov_cache_with_old_data(model, tok, hparams, force_recompute=False) -> Dict[str, Dict]:
-    return _build_cov_cache_from_hparams(model, tok, hparams, force_recompute)
+def calculate_cov_cache_with_old_data(model, tok, hparams, force_recompute=False, include_task=True) -> Dict[str, Dict]:
+    return _build_cov_cache_from_hparams(model, tok, hparams, force_recompute, include_task)
 
 
 def calculate_cov_cache_with_request(
@@ -177,6 +185,7 @@ def calculate_cov_cache_with_request(
         to_collect=["mom2"],
         add_pretrain_data=add_pretrain_data,
         pretrain_sample_size=hparams.mom2_n_samples,
+        stats_devices=getattr(hparams, "kfac_stats_devices", "auto_two"),
     )
 
     layer_to_cov_cache = {}
@@ -395,6 +404,28 @@ def estimate_chunk_kfac(txt, tgt, model, tok, hparams) -> Dict[str, Dict]:
         hparams,
         add_pretrain_data=False,
         sample_size=len(txt),
+    )
+
+
+def refresh_mix_cache(txt_chunks, tgt_chunks, model, tok, hparams):
+    """Re-estimate retention at the current model, as in CrispEdit's mix path.
+
+    Include all completed chunks (including this round) before sampling. The
+    shared estimator samples history, adds Wikipedia, and samples the mixture.
+    Replace the protection factors rather than averaging with stale factors.
+    Edit-side factors are estimated separately on the next current chunk.
+    """
+    texts = [text for chunk in txt_chunks for text in chunk]
+    targets = [target for chunk in tgt_chunks for target in chunk]
+    print(
+        f"[RhoEdit] mix: re-estimate retention on the current model from "
+        f"{len(texts)} completed edits; history/mixture sample limit="
+        f"{hparams.edit_n_samples}, Wikipedia candidates={hparams.mom2_n_samples}."
+    )
+    return calculate_cov_cache_with_request(
+        texts, targets, model, tok, hparams,
+        add_pretrain_data=True,
+        sample_size=hparams.edit_n_samples,
     )
 
 
@@ -697,6 +728,14 @@ def execute_sft_adam_sequential(
     """
     device = model.device
     cache_style = getattr(hparams, "edit_cache_style", "sequential")
+    replay_ratio, replay_max, replay_weight = validate_history_replay(
+        getattr(hparams, "history_replay_ratio", 0.0),
+        getattr(hparams, "history_replay_max", 0),
+        getattr(hparams, "history_replay_weight", 1.0),
+    )
+    fixed_steps = getattr(hparams, "sequential_fixed_steps", False)
+    if (fixed_steps or replay_ratio > 0) and hparams.num_steps <= 0:
+        raise ValueError('Sequential replay/fixed steps require num_steps > 0')
     
     if tok.padding_side != "right":
         tok.padding_side = "right"
@@ -710,30 +749,39 @@ def execute_sft_adam_sequential(
     targets = [r["target_new"] for r in requests]
     rephrases = [r.get("rephrase_prompt") for r in requests]
     txt_chunks, tgt_chunks, reph_chunks = [], [], []
+    history_pool = []
     num_rounds = -(-len(texts) // hparams.num_edits)
 
 
     layer_to_cov_cache_old = calculate_cov_cache_with_old_data(
-        model, tok, hparams, force_recompute=False
+        model, tok, hparams, force_recompute=False, include_task=cache_style != "mix"
     )
     # Algorithm 1: (A_bar_0, B_bar_0, M_0) <- (A_cap, B_cap, N).
     #   samples: N = |D_cap| documents (cache_sample_num)
     #   tokens:  N = tokens that entered the Wikipedia K-FAC pass
     weight_mode = _retention_weight_mode(hparams)
-    if weight_mode == "tokens":
+    if cache_style == "mix" or weight_mode == "tokens":
         retention = _with_token_count(layer_to_cov_cache_old)
     else:
         retention = _with_sample_count(
             layer_to_cov_cache_old, _cache_sample_size(hparams)
         )
 
-    # mix/disable still train the first chunk with the startup wiki+task pair.
-    # sequential waits until the current-chunk edit factors are estimated.
+    # sequential/mix wait for the current-chunk edit factors before building Adam.
     if cache_style == "sequential":
         print(
             "[RhoEdit] edit_cache_style=sequential uses Algorithm 1 "
             f"(post-update mix, weight={weight_mode}, M_0={_retention_sample_count(retention)})."
         )
+        opt = None
+    elif cache_style == "mix":
+        print(
+            "[RhoEdit] mix: edit factors come from each current chunk before training; "
+            "retention starts from Wikipedia and is replaced at each round end "
+            "using history + Wikipedia (CrispEdit sampling)."
+        )
+        if getattr(hparams, "recalculate_cache", False):
+            print("[RhoEdit] mix uses round-boundary refreshes; --recalculate_cache has no mid-round effect.")
         opt = None
     else:
         opt = build_optimizer_with_cov_caches(model, hparams, [layer_to_cov_cache_old])
@@ -759,7 +807,7 @@ def execute_sft_adam_sequential(
     )):
         if tracker is not None:
             tracker.begin_round(round_idx)
-        if cache_style == "sequential":
+        if cache_style in ("sequential", "mix"):
             print(
                 f"[RhoEdit] Estimate edit-side K-FAC on {len(txt_edit)} "
                 "current-chunk samples at theta_{k-1}."
@@ -767,6 +815,17 @@ def execute_sft_adam_sequential(
             edit_cache = estimate_chunk_kfac(txt_edit, tgt_edit, model, tok, hparams)
             paired = pair_retention_with_edit(retention, edit_cache)
             opt = build_optimizer_with_cov_caches(model, hparams, [paired], opt=opt)
+
+        optimizer_steps = 0
+        replay_enabled = replay_ratio > 0 and replay_weight > 0 and bool(history_pool)
+        if replay_enabled:
+            print(
+                f"[RhoEdit] History replay enabled: {len(history_pool)} pairs, "
+                f"ratio={replay_ratio:g}, max_per_batch={replay_max}, "
+                f"weight={replay_weight:g}."
+            )
+            replay_meter = AverageMeter()
+            replay_examples = 0
 
         pbar = trange(hparams.num_steps)
         for it in pbar:
@@ -800,11 +859,59 @@ def execute_sft_adam_sequential(
                 outputs = model(**encodings, labels=labels)
                 loss = outputs.loss
 
-                if loss.item() >= 1e-2:
-                    loss.backward()
+                edit_loss = loss
+                replay_loss = None
+                replay_scale = 0.0
+                if replay_enabled:
+                    replay_count = history_replay_count(
+                        len(txt), replay_ratio, replay_max
+                    )
+                    replay_pairs = sample_history_pairs(history_pool, replay_count)
+                    if replay_pairs:
+                        replay_txt, replay_tgt = zip(*replay_pairs)
+                        replay_inputs_targets = [
+                            txt_ + tgt_ for txt_, tgt_ in zip(replay_txt, replay_tgt)
+                        ]
+                        replay_encodings = tok(
+                            replay_inputs_targets,
+                            return_tensors="pt",
+                            padding=True,
+                            truncation=True,
+                            max_length=hparams.max_length,
+                        ).to(device)
+                        replay_labels = replay_encodings["input_ids"].clone()
+                        replay_labels[replay_labels == tok.pad_token_id] = -100
+                        for replay_i, replay_prompt in enumerate(replay_txt):
+                            replay_prompt_len = len(
+                                tok(
+                                    replay_prompt,
+                                    add_special_tokens=True,
+                                    truncation=True,
+                                    max_length=hparams.max_length,
+                                )["input_ids"]
+                            )
+                            replay_labels[replay_i, :replay_prompt_len] = -100
+                        replay_outputs = model(
+                            **replay_encodings, labels=replay_labels
+                        )
+                        replay_loss = replay_outputs.loss
+                        replay_scale = replay_weight * len(replay_pairs) / max(len(txt), 1)
+                        edit_loss = (
+                            loss + replay_scale * replay_loss
+                        ) / (1.0 + replay_scale)
+                        replay_meter.update(replay_loss.item(), n=len(replay_pairs))
+                        replay_examples += len(replay_pairs)
+
+                total_loss = edit_loss
+
+                # Replay can carry a useful historical gradient even when the
+                # current edit already passes the legacy loss threshold.
+                if fixed_steps or replay_enabled or loss.item() >= 1e-2:
+                    total_loss.backward()
                     opt.step()
-                    # Algorithm 1 does not recompute wiki/task caches mid-round.
-                    if cache_style == "sequential":
+                    optimizer_steps += 1
+                    # Keep both sides fixed within the round; refresh at boundaries.
+                    if cache_style in ("sequential", "mix"):
                         should_recalculate = False
                     else:
                         current_weights_cpu, layer_to_cov_cache_old, should_recalculate = recalculate_cov_cache_if_weights_changed(
@@ -831,13 +938,14 @@ def execute_sft_adam_sequential(
                             opt = build_optimizer_with_cov_caches(model, hparams, [layer_to_cov_cache_old] if layer_to_cov_cache_data is None else [layer_to_cov_cache_old, layer_to_cov_cache_data], opt=opt)
                 loss_meter.update(loss.item(), n=labels.size(0))
             pbar.set_postfix({"loss": f"{loss_meter.avg:.4f}"})
-            if loss_meter.avg < 1e-2:
+            if not fixed_steps and not replay_enabled and loss_meter.avg < 1e-2:
                 break
         print(f"Loss after editing number of samples {len(txt_edit)}: {loss_meter.avg}")
         
         txt_chunks.append(txt_edit)
         tgt_chunks.append(tgt_edit)
         reph_chunks.append(reph_edit)
+        history_pool.extend(zip(txt_edit, tgt_edit))
         # Editor state reported by the tracker (K-FAC factors kept across rounds).
         state_ref = layer_to_cov_cache_old
         
@@ -853,24 +961,12 @@ def execute_sft_adam_sequential(
             state_ref = retention
 
         elif cache_style == "mix":
-            old_txt_list = [item for sublist in txt_chunks for item in sublist]
-            old_tgt_list = [item for sublist in tgt_chunks for item in sublist]
-
-            layer_to_cov_cache_data_pretrain_mix = attach_task_factors(
-                calculate_cov_cache_with_request(
-                    old_txt_list,
-                    old_tgt_list,
-                    model,
-                    tok,
-                    hparams,
-                ),
-                layer_to_cov_cache_old,
+            retention = refresh_mix_cache(
+                txt_chunks, tgt_chunks, model, tok, hparams,
             )
-
-            opt = build_optimizer_with_cov_caches(
-                model, hparams, [layer_to_cov_cache_data_pretrain_mix], opt=opt
-            )
-            state_ref = layer_to_cov_cache_data_pretrain_mix
+            # Install once at the next round start, paired with its edit factors.
+            # Installing now would filter momentum with a stale edit-side basis.
+            state_ref = retention
         elif cache_style == "disable":
             print("[RhoEdit] edit_cache_style=disable; projection cache not updated.")
 
@@ -878,6 +974,15 @@ def execute_sft_adam_sequential(
         old_edit_loss = calculate_old_edit_loss(txt_chunks, tgt_chunks, model, tok)
         metrics.update(old_edit_loss)
         metrics.update({"FT Loss": loss_meter.avg})
+        metrics.update({"Sequential/round": round_idx + 1,
+                        "Sequential/optimizer_steps": optimizer_steps})
+        if replay_enabled:
+            metrics.update({
+                "Sequential/history_replay_ratio": replay_ratio,
+                "Sequential/history_replay_weight": replay_weight,
+                "Sequential/history_replay_examples": replay_examples,
+                "Sequential/history_replay_loss": replay_meter.avg,
+            })
         ExperimentTracker.log(metrics)
 
         if tracker is not None:

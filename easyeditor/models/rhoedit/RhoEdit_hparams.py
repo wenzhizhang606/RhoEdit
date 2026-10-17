@@ -35,6 +35,12 @@ class AdamHyperParams(HyperParams):
     batch_size: int = 32
     max_length: int = 40
     model_parallel: bool = False
+    factor_device: str = "auto"
+    kfac_stats_devices: str = "auto_two"
+    history_replay_ratio: float = 0.0
+    history_replay_max: int = 0
+    history_replay_weight: float = 1.0
+    sequential_fixed_steps: bool = False
 
     @classmethod
     def from_hparams(cls, hparams_name_or_path: str):

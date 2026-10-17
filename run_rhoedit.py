@@ -7,6 +7,8 @@ from easyeditor.models.rhoedit.utils import (
     KFAC_DATASET_ALIASES,
     normalize_kfac_dataset,
 )
+from easyeditor.models.rhoedit.history_replay import validate_history_replay
+from easyeditor.models.rome.kfac_devices import validate_kfac_stats_devices
 from utils import (
     print_time, 
     prepare_requests_from_data_type, 
@@ -81,7 +83,10 @@ def get_arguments():
     # 顺序编辑时如何保护历史编辑
     parser.add_argument('--edit_cache_style', type=str, default='sequential',
                         choices=['sequential', 'mix', 'disable'],
-                        help='Cache style during sequential editing.')
+                        help='sequential: accumulate post-edit factors; mix: re-estimate '
+                             'history + Wikipedia retention after each round using CrispEdit '
+                             'sampling and estimate current-chunk edit factors before training; '
+                             'disable: no round-end refresh.')
     parser.add_argument('--retention_weight', type=str, default='tokens',
                         choices=['samples', 'tokens'],
                         help='Mix weight when merging K-FAC factors into retention '
@@ -101,6 +106,17 @@ def get_arguments():
                         help='Override YAML newton_damping when set.')
     parser.add_argument('--soft_lambda', type=float, default=None,
                         help='Override YAML soft_lambda when set.')
+    parser.add_argument('--history_replay_ratio', type=float, default=None,
+                        help='Historical prompt/target samples per current batch as a ratio; 0 disables replay.')
+    parser.add_argument('--history_replay_max', type=int, default=None,
+                        help='Maximum historical samples replayed per optimizer batch; 0 means uncapped.')
+    parser.add_argument('--history_replay_weight', type=float, default=None,
+                        help='Relative loss weight for historical replay samples (default: 1.0).')
+    parser.add_argument('--sequential_fixed_steps', action='store_true', default=None,
+                        help='Disable low-loss skipping/early stopping in every sequential round, for matched-step ablations.')
+    parser.add_argument('--kfac_stats_devices', type=validate_kfac_stats_devices, default=None,
+                        help='K-FAC statistics placement: auto_two (default), auto_three, model (legacy), '
+                             'or multiple logical CUDA indices, e.g. 0,1,2. Does not move model weights.')
     parser.add_argument('--lr', type=float, default=None,
                         help='Override YAML lr when set.')
 
@@ -135,7 +151,35 @@ def get_hparams(args):
         hparams.newton_damping = args.newton_damping
     if args.soft_lambda is not None:
         hparams.soft_lambda = args.soft_lambda
-
+    if args.history_replay_ratio is not None:
+        hparams.history_replay_ratio = args.history_replay_ratio
+    else:
+        hparams.history_replay_ratio = getattr(hparams, "history_replay_ratio", 0.0)
+    if args.history_replay_max is not None:
+        hparams.history_replay_max = args.history_replay_max
+    else:
+        hparams.history_replay_max = getattr(hparams, "history_replay_max", 0)
+    if args.history_replay_weight is not None:
+        hparams.history_replay_weight = args.history_replay_weight
+    else:
+        hparams.history_replay_weight = getattr(hparams, "history_replay_weight", 1.0)
+    hparams.history_replay_ratio, hparams.history_replay_max, hparams.history_replay_weight = (
+        validate_history_replay(
+            hparams.history_replay_ratio,
+            hparams.history_replay_max,
+            hparams.history_replay_weight,
+        )
+    )
+    hparams.sequential_fixed_steps = (
+        args.sequential_fixed_steps if args.sequential_fixed_steps is not None
+        else getattr(hparams, 'sequential_fixed_steps', False)
+    )
+    if not args.sequential_edit and (hparams.history_replay_ratio > 0 or hparams.sequential_fixed_steps):
+        raise ValueError('History replay and sequential_fixed_steps require --sequential_edit')
+    hparams.kfac_stats_devices = validate_kfac_stats_devices(
+        args.kfac_stats_devices if args.kfac_stats_devices is not None
+        else getattr(hparams, "kfac_stats_devices", "auto_two")
+    )
     hparams.edit_n_samples = args.edit_sample_num
     hparams.recalculate_cache = args.recalculate_cache
     hparams.recalculate_weight_threshold = args.recalculate_weight_threshold
@@ -167,6 +211,10 @@ def calculate_model_name(args, hparams):
         name += f"_edit_cache_{args.edit_cache_style}"
         if args.retention_weight != 'samples':
             name += f"_w{args.retention_weight}_20260923"
+        if getattr(hparams, "history_replay_ratio", 0.0) > 0:
+            name += f"_hreplay_{hparams.history_replay_ratio:g}_{hparams.history_replay_max}_{hparams.history_replay_weight:g}"
+        if hparams.sequential_fixed_steps:
+            name += '_fixedsteps'
 
     return name.replace('.', '_')
 

@@ -1,175 +1,293 @@
-import os
-import json
-from dotenv import load_dotenv
-load_dotenv()
-API_KEY = os.getenv("API_KEY")
-BASE_URL=os.getenv("BASE_URL")
-MODEL=os.getenv("MODEL")
-os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+"""Generate in a disposable process; judge saved answers in the CPU-only parent."""
+
 import argparse
-from utils import print_time, prepare_requests_from_data_type
-from easyeditor.editors.utils import summary_metrics
-from transformers import AutoTokenizer
-from vllm import LLM
-import numpy as np
-from easyeditor.evaluate.evaluate import compute_edit_quality, compute_edit_quality_safety
-from easyeditor.evaluate.evaluate_utils import resolve_pending_llm_judges
-import gc
-import random
-import torch
-from tqdm import tqdm
-from easyeditor.tools import ExperimentTracker
-from easyeditor.util import HyperParams
+from contextlib import contextmanager
+import hashlib
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+import traceback
+from types import SimpleNamespace
+import uuid
 
 
 SEED = 69420
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-torch.cuda.manual_seed_all(SEED)
-torch.backends.cudnn.deterministic = True
 
-def get_model_and_tokenizer_from_dir(edited_model_dir_local):
-    # 替换为vllm库加载模型
-    PREFIX_DIR = os.getenv("HF_CACHE_DIR")
-    edited_model_dir = PREFIX_DIR + edited_model_dir_local
-    print(f"[vLLM] Loading model from: {edited_model_dir}")
-    tokenizer = AutoTokenizer.from_pretrained(
-        edited_model_dir,
-        trust_remote_code=True,
-    )
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "left"
-    model = LLM(
-        model=edited_model_dir,
-        tokenizer=edited_model_dir,
-        dtype="bfloat16",
-        trust_remote_code=True,
-        tensor_parallel_size=1,
-        gpu_memory_utilization=0.9,
-    )
-    return model, tokenizer
 
-def release_vllm_gpu(model):
-    """Unload vLLM after generation so judging no longer occupies the GPU."""
-    print("[vLLM] generation finished, releasing GPU")
-    try:
-        from vllm.distributed.parallel_state import destroy_model_parallel
-        destroy_model_parallel()
-    except Exception as exc:
-        print(f"[vLLM] destroy_model_parallel skipped: {exc}")
-
-    engine = getattr(model, "llm_engine", None)
-    executor = getattr(engine, "model_executor", None) if engine is not None else None
-    if executor is not None:
-        shutdown = getattr(executor, "shutdown", None)
-        if callable(shutdown):
-            try:
-                shutdown()
-            except Exception as exc:
-                print(f"[vLLM] executor.shutdown skipped: {exc}")
-        if hasattr(executor, "driver_worker"):
-            executor.driver_worker = None
-        engine.model_executor = None
-    if engine is not None:
-        model.llm_engine = None
-    del engine, executor
-
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        free, total = torch.cuda.mem_get_info()
-        print(f"[vLLM] GPU free {free / 1e9:.2f}/{total / 1e9:.2f} GB")
-    if hasattr(torch, "set_default_device"):
-        torch.set_default_device("cpu")
-    print("[vLLM] subsequent steps run on CPU")
-
-def get_arguments():
+def get_arguments(argv=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument('--edited_model_dir', required=True, type=str, default=None, help='Path to edited model for evaluation.')
-    parser.add_argument('--data_type', required=True, type=str, default='zsre', choices=['zsre', 'counterfact', 'multi_counterfact', 'wiki', 'safeedit_train', 'safeedit_test','zsre10k'])
-    parser.add_argument('--eval_num', required=False, type=int, default=3000, help='Number of evaluation instances to use. Default uses all.')
-    parser.add_argument('--max_length', required=False, type=int, default=40, help='Maximum length of the generated sequences.')
-    parser.add_argument('--context_type', required=True, type=str, default='qa_inst', choices=['qa_inst', 'chat_temp', 'no_context'], help='Type of context to use for evaluation.')
-    parser.add_argument('--alg_name', required=True, type=str, default='ft_edit', help='Name of the editing algorithm used.')
-    parser.add_argument('--model_name', required=True, type=str, default='gpt2-xl', help='Name of the base model used.')
-    parser.add_argument('--evaluation_criteria', required=True, type=str, default='exact_match', choices=['exact_match', 'llm_judge'], help='Evaluation criteria to use.')  
-    parser.add_argument('--wandb_project', type=str, default='CrispEdit_EVAL', help='WandB project name.')
-    parser.add_argument('--wandb_run_id', type=str, default=None, help='WandB run ID for resuming runs.')
-    parser.add_argument('--no_wandb', action='store_true', help='Disable wandb logging.')
-    parser.add_argument('--judge_batch_size', required=False, type=int, default=16, help='Number of generated answers to judge per batch.')
-    args = parser.parse_args()
+    parser.add_argument('--edited_model_dir', required=True)
+    parser.add_argument('--data_type', required=True,
+                        choices=['zsre', 'counterfact', 'multi_counterfact', 'wiki',
+                                 'safeedit_train', 'safeedit_test', 'zsre10k'])
+    parser.add_argument('--eval_num', type=int, default=3000)
+    parser.add_argument('--max_length', type=int, default=40)
+    parser.add_argument('--context_type', required=True, choices=['qa_inst', 'chat_temp', 'no_context'])
+    parser.add_argument('--alg_name', required=True)
+    parser.add_argument('--model_name', required=True)
+    parser.add_argument('--evaluation_criteria', required=True, choices=['exact_match', 'llm_judge'])
+    parser.add_argument('--wandb_project', default='CrispEdit_EVAL')
+    parser.add_argument('--wandb_run_id', default=None)
+    parser.add_argument('--no_wandb', action='store_true')
+    parser.add_argument('--judge_batch_size', type=int, default=16)
+    parser.add_argument('--judge_only', action='store_true',
+                        help='Reuse a completed generation from this script, without loading a model.')
+    parser.add_argument('--_generation_worker', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--_generation_run_id', default=None, help=argparse.SUPPRESS)
+    args = parser.parse_args(argv)
+    if args.eval_num <= 0 or args.max_length <= 0 or args.judge_batch_size <= 0:
+        parser.error('eval_num, max_length and judge_batch_size must be positive')
+    if args._generation_worker and (not args._generation_run_id or args.judge_only):
+        parser.error('Invalid generation worker arguments')
     return args
 
+
 def build_hparams_from_args(args):
-    hparams = HyperParams()
-    hparams.alg_name = args.alg_name
-    hparams.context_type = args.context_type
-    hparams.max_length = args.max_length
-    hparams.api_key = API_KEY
-    hparams.base_url = BASE_URL
-    hparams.model = MODEL
-    hparams.evaluation_type = "WILD"
-    hparams.model_name = args.model_name
-    hparams.evaluation_criteria = args.evaluation_criteria
-    hparams.data_type = args.data_type
-    return hparams
-
-if __name__ == "__main__":
-    args = get_arguments()
-    hparams = build_hparams_from_args(args)
-    requests = prepare_requests_from_data_type(args.data_type)
-    model, tokenizer = get_model_and_tokenizer_from_dir(args.edited_model_dir)
-    # device expects the device number only
-    device = 0
-
-    run_name = args.edited_model_dir + f"_eval_{args.evaluation_criteria}_{args.context_type}"
-    ExperimentTracker.init(
-        project=args.wandb_project,
-        name=run_name,
-        config=vars(hparams),
-        tracker_type="wandb",
-        mode=not args.no_wandb,
+    return SimpleNamespace(
+        alg_name=args.alg_name, context_type=args.context_type, max_length=args.max_length,
+        api_key=os.getenv('API_KEY'), base_url=os.getenv('BASE_URL'), model=os.getenv('MODEL'),
+        evaluation_type='WILD', model_name=args.model_name,
+        evaluation_criteria=args.evaluation_criteria, data_type=args.data_type,
     )
 
-    # before evaluation, always make sure tokenizer padding side is correct
+
+def evaluation_name(args):
+    return args.edited_model_dir + f'_eval_{args.evaluation_criteria}_{args.context_type}'
 
 
-    print_time("Begin Post Edit Eval Time")
-    requests = random.sample(requests, len(requests))
-    if args.eval_num is not None:
-        requests = requests[:args.eval_num]
+def generation_config(args):
+    return {name: getattr(args, name) for name in (
+        'edited_model_dir', 'model_name', 'alg_name', 'data_type', 'context_type',
+        'evaluation_criteria', 'eval_num', 'max_length',
+    )}
 
+
+def atomic_json(path, value):
+    path = Path(path)
+    temporary = path.with_name(path.name + '.tmp')
+    with temporary.open('w', encoding='utf-8') as stream:
+        json.dump(value, stream, ensure_ascii=False, indent=4)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+
+
+@contextmanager
+def evaluation_lock(log_dir):
+    """Avoid concurrent writers to the same result directory on Linux."""
+    with (log_dir / '.evaluation.lock').open('a') as lock:
+        if os.name == 'posix':
+            import fcntl
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise RuntimeError(f'Another evaluation owns {log_dir}') from exc
+        yield
+
+
+def _group_alive(group_id):
+    # Reparented zombies no longer own CUDA contexts or memory.
+    if sys.platform.startswith('linux'):
+        for proc in Path('/proc').iterdir():
+            if not proc.name.isdigit():
+                continue
+            try:
+                fields = (proc / 'stat').read_text().rsplit(')', 1)[1].split()
+                if int(fields[2]) == group_id and fields[0] not in ('Z', 'X'):
+                    return True
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+        return False
+    try:
+        os.killpg(group_id, 0)
+        return True
+    except ProcessLookupError:
+        return False
+
+
+def stop_generation_group(process, grace_seconds=5.0):
+    """Stop only this child's process group, including its vLLM workers."""
+    if os.name != 'posix':
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=grace_seconds)
+        return
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(process.pid, sig)
+        except ProcessLookupError:
+            break
+        deadline = time.monotonic() + grace_seconds
+        while time.monotonic() < deadline:
+            process.poll()
+            if not _group_alive(process.pid):
+                break
+            time.sleep(.1)
+        if not _group_alive(process.pid):
+            break
+    else:
+        raise RuntimeError('Generation workers have not exited; refusing to start the judge')
+    process.wait(timeout=grace_seconds)
+
+
+def run_generation_process(command, env):
+    def interrupted(signum, frame):
+        raise SystemExit(128 + signum)
+
+    # A separate session protects workers from terminal signals. Forward parent
+    # termination through the same cleanup path so those workers are not orphaned.
+    previous_handler = signal.signal(signal.SIGTERM, interrupted)
+    process = None
+    try:
+        process = subprocess.Popen(command, env=env, start_new_session=(os.name == 'posix'))
+        returncode = process.wait()
+    finally:
+        try:
+            if process is not None:
+                stop_generation_group(process)
+        finally:
+            signal.signal(signal.SIGTERM, previous_handler)
+    if returncode:
+        raise subprocess.CalledProcessError(returncode, command)
+
+
+def get_model_and_tokenizer_from_dir(edited_model_dir_local):
+    from transformers import AutoTokenizer
+    from vllm import LLM
+
+    prefix = os.getenv('HF_CACHE_DIR')
+    if not prefix:
+        raise RuntimeError('HF_CACHE_DIR is not set')
+    edited_model_dir = prefix + edited_model_dir_local
+    print(f'[vLLM] Loading model from: {edited_model_dir}', flush=True)
+    tokenizer = AutoTokenizer.from_pretrained(edited_model_dir, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = 'left'
+    model = LLM(model=edited_model_dir, tokenizer=edited_model_dir, dtype='bfloat16',
+                trust_remote_code=True, tensor_parallel_size=1, gpu_memory_utilization=0.9)
+    return model, tokenizer
+
+
+def run_generation(args, hparams, log_dir):
+    import random
+    import numpy as np
+    import torch
+    from tqdm import tqdm
+    from utils import prepare_requests_from_data_type
+    from easyeditor.evaluate.evaluate import compute_edit_quality, compute_edit_quality_safety
+
+    random.seed(SEED)
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
+    torch.cuda.manual_seed_all(SEED)
+    torch.backends.cudnn.deterministic = True
+    state = {'run_id': args._generation_run_id, 'state': 'running',
+             'config': generation_config(args), 'cases': 0}
+    state_path = log_dir / 'generation_state.json'
+    result_path = log_dir / 'results_pending_judge.json'
+    atomic_json(state_path, state)
+    requests = prepare_requests_from_data_type(args.data_type)
+    if not requests:
+        raise ValueError('No evaluation requests')
+    model, tokenizer = get_model_and_tokenizer_from_dir(args.edited_model_dir)
+    # Preserve the previous ordering: model initialization precedes sampling.
+    requests = random.sample(requests, len(requests))[:args.eval_num]
+    evaluate = compute_edit_quality_safety if 'safe' in args.data_type else compute_edit_quality
     all_metrics = []
-    log_dir = f"./logs/{run_name}"
-    os.makedirs(log_dir, exist_ok=True)
-
-    print("="*50)
-    print("safe" not in args.data_type)
-    edit_eval_method = compute_edit_quality if "safe" not in args.data_type else compute_edit_quality_safety
     for i, request in enumerate(tqdm(requests)):
-        metrics = {
-            'case_id': i,
-            "requested_rewrite": request,
-            "pre": {},
-            "post": edit_eval_method(model, hparams.model_name, hparams, tokenizer, request, device)
-        }
-        all_metrics.append(metrics)
-        with open(os.path.join(log_dir, "results_pending_judge.json"), "w", encoding="utf-8") as f:
-            json.dump(all_metrics, f, ensure_ascii=False, indent=4)
+        all_metrics.append({
+            'case_id': i, 'requested_rewrite': request, 'pre': {},
+            'post': evaluate(model, hparams.model_name, hparams, tokenizer, request, 0),
+        })
+        atomic_json(result_path, all_metrics)
+    state.update(state='complete', cases=len(all_metrics),
+                 sha256=hashlib.sha256(result_path.read_bytes()).hexdigest())
+    atomic_json(state_path, state)
+    print(f'[generation] Saved {len(all_metrics)} cases; exiting GPU process.', flush=True)
+    # Keep model references alive until os._exit; old vLLM destructors/atexit
+    # handlers can otherwise hang before the parent gets control back.
+    return model, tokenizer
 
-    release_vllm_gpu(model)
-    del model
 
-    if args.evaluation_criteria == "llm_judge":
-        all_metrics = resolve_pending_llm_judges(
-            all_metrics,
-            hparams.api_key,
-            batch_size=args.judge_batch_size,
-        )
+def load_completed_generation(args, log_dir, run_id=None):
+    state_path = log_dir / 'generation_state.json'
+    if not state_path.exists():
+        raise RuntimeError('Missing generation completion record; cannot verify saved answers are complete')
+    state = json.loads(state_path.read_text(encoding='utf-8'))
+    if state.get('state') != 'complete' or state.get('config') != generation_config(args):
+        raise RuntimeError('Generation incomplete or evaluation arguments differ from saved generation')
+    if run_id is not None and state.get('run_id') != run_id:
+        raise RuntimeError('Completion record belongs to an older generation')
+    raw = (log_dir / 'results_pending_judge.json').read_bytes()
+    if hashlib.sha256(raw).hexdigest() != state.get('sha256'):
+        raise RuntimeError('Saved generation hash mismatch')
+    data = json.loads(raw)
+    if not isinstance(data, list) or not data or len(data) != state.get('cases'):
+        raise RuntimeError('Saved generation count mismatch')
+    return data
 
-    summary_metrics(all_metrics, log_dir)
 
-    print_time("End Post Edit Eval Time") 
-    ExperimentTracker.finish()
+def run_judging(args, hparams, log_dir, all_metrics):
+    # Original parent; GPUs are hidden before any EasyEdit or torch import.
+    from easyeditor.editors.utils import summary_metrics
+    from easyeditor.tools import ExperimentTracker
+
+    config = {key: value for key, value in vars(hparams).items() if key not in ('api_key', 'base_url')}
+    ExperimentTracker.init(project=args.wandb_project, name=evaluation_name(args),
+                           config=config, tracker_type='wandb', mode=not args.no_wandb)
+    try:
+        if args.evaluation_criteria == 'llm_judge':
+            from easyeditor.evaluate.evaluate_utils import resolve_pending_llm_judges
+            print(f'[llm_judge] Starting in CPU-only parent pid={os.getpid()}.', flush=True)
+            all_metrics = resolve_pending_llm_judges(
+                all_metrics, hparams.api_key, batch_size=args.judge_batch_size,
+            )
+        summary_metrics(all_metrics, str(log_dir))
+        print(f'[evaluation] Results saved to {log_dir}', flush=True)
+    finally:
+        ExperimentTracker.finish()
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    args = get_arguments(argv)
+    from dotenv import load_dotenv
+    load_dotenv()
+    os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+    hparams = build_hparams_from_args(args)
+    log_dir = Path('./logs') / evaluation_name(args)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    if args._generation_worker:
+        try:
+            resources = run_generation(args, hparams, log_dir)
+        except BaseException:
+            traceback.print_exc()
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(1)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)  # Persisted JSON is the handoff; no model crosses it.
+
+    generation_env = os.environ.copy()
+    os.environ['CUDA_VISIBLE_DEVICES'] = ''
+    with evaluation_lock(log_dir):
+        run_id = None
+        if not args.judge_only:
+            run_id = uuid.uuid4().hex
+            command = [sys.executable, '-u', str(Path(__file__).resolve()), *argv,
+                       '--_generation_worker', '--_generation_run_id', run_id]
+            print('[generation] Starting a dedicated GPU process.', flush=True)
+            run_generation_process(command, generation_env)
+            print('[generation] GPU process and its workers exited; loading saved answers.', flush=True)
+        all_metrics = load_completed_generation(args, log_dir, run_id)
+        run_judging(args, hparams, log_dir, all_metrics)
+
+
+if __name__ == '__main__':
+    main()

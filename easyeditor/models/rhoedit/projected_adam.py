@@ -35,7 +35,10 @@ class ProjectedAdam(Adam):
         soft_lambda: float = 1.0,
         factor_damping: float = 1e-5,
         cache_generalized_basis: bool = True,
+        factor_device: str = "auto",
     ):
+        if factor_device not in ("auto", "cpu", "cuda"):
+            raise ValueError("factor_device must be auto, cpu or cuda")
         super().__init__(
             params,
             lr=lr,
@@ -54,6 +57,7 @@ class ProjectedAdam(Adam):
 
         self.factor_damping = max(float(factor_damping), 0.0)
         self.cache_generalized_basis = bool(cache_generalized_basis)
+        self.factor_device = factor_device
 
     def reset_cache(self, new_projection_cache_map):
         # Sequential edits swap K-FAC caches; re-project Adam momentum into the new basis.
@@ -80,10 +84,6 @@ class ProjectedAdam(Adam):
             if projected is not None:
                 exp_avg.copy_(projected)
 
-    # Qwen2.5-7B down_proj input dim is 18944; GPU eigh of that fp64
-    # factor asks for ~8 GiB extra workspace and OOMs next to the model.
-    _CPU_FACTOR_DIM = 8192
-
     @staticmethod
     def _tensor(cache: Dict, key: str, like: torch.Tensor, dtype: torch.dtype):
         value = cache.get(key, None)
@@ -91,11 +91,15 @@ class ProjectedAdam(Adam):
             return None
         return value.to(device=like.device, dtype=dtype)
 
-    @classmethod
-    def _factor_work_device(cls, tensor: torch.Tensor) -> torch.device:
-        if max(tensor.shape) >= cls._CPU_FACTOR_DIM:
+    def _factor_work_device(
+        self, tensor: torch.Tensor, default_device: Optional[torch.device] = None
+    ) -> torch.device:
+        if self.factor_device == "cpu":
             return torch.device("cpu")
-        return tensor.device
+        device = tensor.device if default_device is None else default_device
+        if self.factor_device == "cuda" and device.type != "cuda":
+            raise ValueError("factor_device=cuda requires a CUDA training device")
+        return device
 
     @staticmethod
     def _symmetrize(matrix: torch.Tensor) -> torch.Tensor:
@@ -141,15 +145,30 @@ class ProjectedAdam(Adam):
                 f"eig_b={tuple(eig_b.shape)}, q_b={tuple(q_b.shape)}."
             )
 
-    def _generalized_basis(self, edit_factor, cap_factor):
+    def _generalized_basis(self, edit_factor, cap_factor, device=None):
+        work_device = self._factor_work_device(edit_factor, device)
+        try:
+            return self._generalized_basis_on_device(edit_factor, cap_factor, work_device)
+        except torch.cuda.OutOfMemoryError:
+            if self.factor_device != "auto" or work_device.type != "cuda":
+                raise
+        # Retry outside the exception handler so its traceback no longer holds
+        # CUDA temporaries from the failed decomposition.
+        with torch.cuda.device(work_device):
+            torch.cuda.empty_cache()
+        print(f"[RhoEdit] K-FAC factor {tuple(edit_factor.shape)} OOM on {work_device}; retrying on CPU.")
+        return self._generalized_basis_on_device(edit_factor, cap_factor, torch.device("cpu"))
+
+    def _generalized_basis_on_device(self, edit_factor, cap_factor, work_device):
         # Solve Q^T A_e Q = I and Q^T A_c Q = diag(a) via damped Cholesky:
         # A_e_reg = L L^T, whitened = L^{-1} A_c L^{-T}, then q = L^{-T} V.
         self._check_square(edit_factor, "edit_factor")
         self._check_square(cap_factor, "cap_factor")
 
         cache_dtype = edit_factor.dtype
-        edit_factor = edit_factor.to(dtype=torch.float64)
-        cap_factor = cap_factor.to(dtype=torch.float64)
+        # Inputs stay in the cache until this call, so transfer OOMs are covered too.
+        edit_factor = edit_factor.to(device=work_device, dtype=torch.float64)
+        cap_factor = cap_factor.to(device=work_device, dtype=torch.float64)
 
         edit_factor = self._symmetrize(edit_factor)
         cap_factor = self._symmetrize(cap_factor)
@@ -162,9 +181,13 @@ class ProjectedAdam(Adam):
         )
 
         L = torch.linalg.cholesky(edit_factor_reg)
+        del edit_factor, edit_factor_reg
         tmp = torch.linalg.solve_triangular(L, cap_factor, upper=False)
+        del cap_factor
         whitened_cap = torch.linalg.solve_triangular(L, tmp.T, upper=False).T
+        del tmp
         cap_eigs, cap_vecs = torch.linalg.eigh(whitened_cap)
+        del whitened_cap
 
         q = torch.linalg.solve_triangular(L.transpose(-1, -2), cap_vecs, upper=True)
         # Dual basis R = Q^{-T} = L V, with R^T Q = I.
@@ -228,10 +251,9 @@ class ProjectedAdam(Adam):
     def _factors_from_cache(self, tensor: torch.Tensor, cache: Dict, dtype: torch.dtype):
         for edit_keys, cap_keys in self._FACTOR_KEY_SETS:
             if all(key in cache for key in (*edit_keys, *cap_keys)):
-                edit_a = self._tensor(cache, edit_keys[0], tensor, dtype)
-                edit_b = self._tensor(cache, edit_keys[1], tensor, dtype)
-                cap_a = self._tensor(cache, cap_keys[0], tensor, dtype)
-                cap_b = self._tensor(cache, cap_keys[1], tensor, dtype)
+                # Do not stage all four dense factors on GPU at once.
+                edit_a, edit_b = (cache[key] for key in edit_keys)
+                cap_a, cap_b = (cache[key] for key in cap_keys)
                 return edit_a, edit_b, cap_a, cap_b
         return None
 
@@ -241,8 +263,12 @@ class ProjectedAdam(Adam):
             return None
 
         edit_a, edit_b, cap_a, cap_b = factors
-        q_a, dual_q_a, eig_a = self._generalized_basis(edit_a, cap_a)
-        q_b, dual_q_b, eig_b = self._generalized_basis(edit_b, cap_b)
+        q_a, dual_q_a, eig_a = (
+            value.cpu() for value in self._generalized_basis(edit_a, cap_a, tensor.device)
+        )
+        q_b, dual_q_b, eig_b = (
+            value.cpu() for value in self._generalized_basis(edit_b, cap_b, tensor.device)
+        )
 
         if self.cache_generalized_basis:
             cache["soft_q_a"] = q_a.detach().cpu()
@@ -252,7 +278,12 @@ class ProjectedAdam(Adam):
             cache["soft_eig_a"] = eig_a.detach().cpu()
             cache["soft_eig_b"] = eig_b.detach().cpu()
 
-        return q_a, q_b, dual_q_a, dual_q_b, eig_a, eig_b
+        # CPU decompositions are cached on CPU; only their results are needed
+        # on the gradient's device for the spectral filter below.
+        return tuple(
+            value.to(device=tensor.device, dtype=dtype)
+            for value in (q_a, q_b, dual_q_a, dual_q_b, eig_a, eig_b)
+        )
 
     def _get_generalized_basis(self, tensor: torch.Tensor, cache: Dict, dtype: torch.dtype):
         precomputed = self._basis_from_precomputed(tensor, cache, dtype)

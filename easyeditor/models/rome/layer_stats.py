@@ -14,6 +14,7 @@ from ...util.globals import *
 from ...util.nethook import Trace, set_requires_grad
 from ...util.runningstats import CombinedStat, Mean, NormMean, SecondMoment, tally, make_loader
 from dotenv import load_dotenv
+from .kfac_devices import kfac_layer_devices, accumulate_kfac_factors
 
 load_dotenv()
 CACHE_DIR = os.getenv("HF_DATASETS_DIR")
@@ -436,6 +437,7 @@ def layer_stats_kfac_one_pass(
     batch_tokens=None,
     progress=tqdm,
     force_recompute=False,
+    stats_devices="model",
 ):
     # --- 1. Setup paths and check cache for ALL layers ---
     if model_name is None:
@@ -462,6 +464,8 @@ def layer_stats_kfac_one_pass(
     if not missing_layers:
         print("已找到缓存！！！")
         return results
+
+    layer_devices = kfac_layer_devices(layer_names, model.device, stats_devices)
 
     # print(f"Recalculating KFAC for {len(missing_layers)} layers: {missing_layers}")
 
@@ -515,8 +519,8 @@ def layer_stats_kfac_one_pass(
         # Init A and B
         in_dim, out_dim = get_in_and_out_dim_from_layer(module, target_name)
         matrices[layer_name] = {
-            "A": torch.zeros((in_dim, in_dim), dtype=dtype, device=model.device),
-            "B": torch.zeros((out_dim, out_dim), dtype=dtype, device=model.device)
+            "A": torch.zeros((in_dim, in_dim), dtype=dtype, device=layer_devices[layer_name]),
+            "B": torch.zeros((out_dim, out_dim), dtype=dtype, device=layer_devices[layer_name])
         }
         
         # Register Hook
@@ -588,18 +592,10 @@ def layer_stats_kfac_one_pass(
                         if layer_name not in captured_inputs or layer_name not in captured_grads:
                             continue
                         
-                        feat_in = captured_inputs[layer_name].to(model.device)
-                        grad_out = captured_grads[layer_name].to(model.device)
-                        
-                        # Truncate to match valid mask logic (seq_len - 1)
-                        feat_in = feat_in[:, :-1, :]
-                        grad_out = grad_out[:, :-1, :]
-
-                        input_flat = feat_in[valid_mask].to(dtype=dtype)
-                        grad_flat = grad_out[valid_mask].to(dtype=dtype)
-                        
-                        matrices[layer_name]["A"].addmm_(input_flat.T, input_flat)
-                        matrices[layer_name]["B"].addmm_(grad_flat.T, grad_flat)
+                        accumulate_kfac_factors(
+                            matrices[layer_name], captured_inputs[layer_name],
+                            captured_grads[layer_name], valid_mask,
+                        )
 
                         # if A or B has null, breakpoint
                         if torch.any(torch.isnan(matrices[layer_name]["A"])) or torch.any(torch.isinf(matrices[layer_name]["A"])):
@@ -623,8 +619,10 @@ def layer_stats_kfac_one_pass(
         param.requires_grad = grads[name]
 
     for layer_name in missing_layers:
-        A = matrices[layer_name]["A"] / total_tokens
-        B = matrices[layer_name]["B"] / total_tokens
+        factors = matrices.pop(layer_name)
+        A = factors["A"].to("cpu") / total_tokens
+        B = factors["B"].to("cpu") / total_tokens
+        del factors
         
         # Save individually to match original file structure
         # if force_recompute then we skip saving
@@ -796,7 +794,9 @@ def layer_stats_kfac_with_txt_tgt(
     precision=None,
     batch_tokens=None,
     progress=tqdm,
+    stats_devices="model",
 ):
+    layer_devices = kfac_layer_devices(layer_names, model.device, stats_devices)
     # --- 1. Setup paths and check cache for ALL layers ---
     def get_ds(txt, tgt):
         all_texts = [t + g for t, g in zip(txt, tgt)]
@@ -865,8 +865,8 @@ def layer_stats_kfac_with_txt_tgt(
 
         in_dim, out_dim = get_in_and_out_dim_from_layer(module, target_name)
         layer_to_cov_cache[layer_name] = {
-            "A": torch.zeros((in_dim, in_dim), dtype=dtype, device=model.device),
-            "B": torch.zeros((out_dim, out_dim), dtype=dtype, device=model.device)
+            "A": torch.zeros((in_dim, in_dim), dtype=dtype, device=layer_devices[layer_name]),
+            "B": torch.zeros((out_dim, out_dim), dtype=dtype, device=layer_devices[layer_name])
         }
         
         handles.append(module.register_forward_hook(get_hook(layer_name)))
@@ -927,17 +927,10 @@ def layer_stats_kfac_with_txt_tgt(
                         if layer_name not in captured_inputs or layer_name not in captured_grads:
                             continue
 
-                        feat_in = captured_inputs[layer_name].to(model.device)
-                        grad_out = captured_grads[layer_name].to(model.device)
-
-                        # Truncate to match valid mask logic (seq_len - 1)
-                        feat_in = feat_in[:, :-1, :]
-                        grad_out = grad_out[:, :-1, :]
-                        kfac_dtype = layer_to_cov_cache[layer_name]["A"].dtype
-                        input_flat = feat_in[valid_mask].to(dtype=kfac_dtype)
-                        grad_flat = grad_out[valid_mask].to(dtype=kfac_dtype)
-                        layer_to_cov_cache[layer_name]["A"].addmm_(input_flat.T, input_flat)
-                        layer_to_cov_cache[layer_name]["B"].addmm_(grad_flat.T, grad_flat)
+                        accumulate_kfac_factors(
+                            layer_to_cov_cache[layer_name], captured_inputs[layer_name],
+                            captured_grads[layer_name], valid_mask,
+                        )
                 
                 total_tokens += current_valid_tokens
 
