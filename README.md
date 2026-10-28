@@ -26,16 +26,18 @@ CUDA_VISIBLE_DEVICES=0 python run_rhoedit.py \
   --no_wandb
 ```
 
-顺序编辑：
+顺序编辑（默认使用 `sequential` 缓存策略，即 Algorithm 1）：
 
 ```bash
 python run_rhoedit.py --model qwen2.5-7b --data_type zsre \
-  --sequential_edit --num_edits 100 --edit_cache_style mix
+  --sequential_edit --num_edits 100
 ```
 
 顺序编辑的实验图表（默认关闭）：加 `--seq_plot_every N` 后每 N 轮在当前及所有历史 chunk 上评估（teacher-forced token 准确率、paraphrase 泛化、wiki loss 漂移、累计编辑时间、峰值显存、编辑器状态大小），结束时输出到 `./logs/<run-id>/sequential/`：`fig2a_retention_heatmap.png`、`table8_round_curves.png`、`sequential_metrics.json`、`summary.json`。跨方法的 Fig.2b 用 `python plot_sequential.py --compare <run-A>/summary.json <run-B>/summary.json --labels A B`。
 
 常用覆盖：`--lr`、`--newton_damping`、`--soft_lambda`（不传则用 YAML）。模型保存到 `${HF_CACHE_DIR}<run-id>/`。
+
+K-FAC 分解默认 `--factor_device auto`：优先使用训练设备，CUDA 显存不足时对该因子回退 CPU，并打印提示。大矩阵不再按尺寸强制切到 CPU。`--factor_device cuda` 强制使用训练 GPU，显存不足直接报错；`--factor_device cpu` 强制在 CPU 分解。分解仍使用 float64，缓存基底保持在 CPU。
 
 ## 评测
 
