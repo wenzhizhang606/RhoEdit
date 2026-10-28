@@ -79,9 +79,14 @@ def get_arguments():
     parser.add_argument('--recalculate_weight_threshold', type=float, default=0.25,
                         help='Threshold for recalculating weight projection caches. [0.0-1.0]')
     # 顺序编辑时如何保护历史编辑
-    parser.add_argument('--edit_cache_style', type=str, default='mix',
+    parser.add_argument('--edit_cache_style', type=str, default='sequential',
                         choices=['sequential', 'mix', 'disable'],
                         help='Cache style during sequential editing.')
+    parser.add_argument('--retention_weight', type=str, default='tokens',
+                        choices=['samples', 'tokens'],
+                        help='Mix weight when merging K-FAC factors into retention '
+                             '(edit_cache_style=sequential): samples = documents/requests, '
+                             'tokens = tokens that entered each factor.')
     
     # wandb/swanlab
     parser.add_argument('--wandb_project', type=str, default='RhoEdit',
@@ -135,6 +140,7 @@ def get_hparams(args):
     hparams.recalculate_cache = args.recalculate_cache
     hparams.recalculate_weight_threshold = args.recalculate_weight_threshold
     hparams.edit_cache_style = args.edit_cache_style
+    hparams.retention_weight = args.retention_weight
 
     hparams.disable_old_loss_check = args.disable_old_loss_check
 
@@ -150,7 +156,7 @@ def get_hparams(args):
 def calculate_model_name(args, hparams):
     name = (f"{args.model}_rhoedit_adam_{args.data_type}"
                         f"_{hparams.task_mom2_dataset}"
-                        f"_{hparams.newton_damping}_{hparams.soft_lambda}_{hparams.lr}_12_19")
+                        f"_{hparams.newton_damping}_{hparams.soft_lambda}_{hparams.lr}_now_")
 
     if args.sequential_edit:
         name += f"_sequential_{args.num_edits}"
@@ -159,6 +165,8 @@ def calculate_model_name(args, hparams):
         name += f"_recalc_cache_{args.recalculate_weight_threshold}_edit_sample_{args.edit_sample_num}"
     if args.sequential_edit:
         name += f"_edit_cache_{args.edit_cache_style}"
+        if args.retention_weight != 'samples':
+            name += f"_w{args.retention_weight}_20260923"
 
     return name.replace('.', '_')
 
@@ -184,7 +192,7 @@ if __name__ == "__main__":
     model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, device_map='auto',  
                                     local_files_only=True)
     '''
-
+    '''
     #qwen2.5
     tokenizer = AutoTokenizer.from_pretrained(
         MODEL_NAME,
@@ -226,7 +234,7 @@ if __name__ == "__main__":
         device_map="auto",
         local_files_only=True,
     )
-    '''
+    
     # set appropriate padding token
     model, tokenizer = update_model_and_tokenizer_with_appropriate_padding_token(model, tokenizer, hparams)
     

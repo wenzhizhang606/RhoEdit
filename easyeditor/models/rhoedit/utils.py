@@ -50,75 +50,6 @@ def _model_device(model) -> torch.device:
     return getattr(model, "device", next(model.parameters()).device)
 
 
-def _embed_device(model) -> torch.device:
-    embed = model.get_input_embeddings()
-    weight = getattr(embed, "weight", None)
-    if weight is not None:
-        return weight.device
-    return _model_device(model)
-
-
-def _tokenize_sft_batch(
-    model,
-    tok: AutoTokenizer,
-    txt: List[str],
-    tgt: List[str],
-    max_length: int,
-) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
-    """Tokenize prompt+target with the same label mask as GitHub training.
-
-    Loss is computed in ``_causal_nll`` against ``lm_head`` width. Do not pass
-    ``labels`` into HuggingFace: transformers 4.46 uses
-    ``logits.view(-1, config.vocab_size)``, which CUDA-asserts when Llama's
-    added PAD id equals the original vocab size.
-    """
-    encodings = tok(
-        [prefix + suffix for prefix, suffix in zip(txt, tgt)],
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-        max_length=max_length,
-    )
-    encodings = {key: value.to(_embed_device(model)) for key, value in encodings.items()}
-    labels = encodings["input_ids"].clone()
-    if tok.pad_token_id is not None:
-        labels[labels == tok.pad_token_id] = -100
-    seq_len = labels.size(1)
-    for i, prompt in enumerate(txt):
-        prompt_len = len(
-            tok(
-                prompt,
-                add_special_tokens=True,
-                truncation=True,
-                max_length=max_length,
-            )["input_ids"]
-        )
-        labels[i, : min(prompt_len, seq_len)] = -100
-    return encodings, labels
-
-
-def _causal_nll(
-    model,
-    encodings: Dict[str, torch.Tensor],
-    labels: torch.Tensor,
-) -> Optional[torch.Tensor]:
-    """NLL on logits[..., :-1] vs labels[..., 1:], class dim = lm_head width."""
-    outputs = model(**encodings, use_cache=False)
-    logits = outputs.logits
-    shift_logits = logits[:, :-1, :].float().contiguous()
-    shift_labels = labels[:, 1:].to(device=shift_logits.device)
-    num_classes = shift_logits.size(-1)
-    invalid = (shift_labels >= num_classes) | ((shift_labels < 0) & (shift_labels != -100))
-    shift_labels = shift_labels.masked_fill(invalid, -100)
-    if int((shift_labels != -100).sum()) == 0:
-        return None
-    return torch.nn.functional.cross_entropy(
-        shift_logits.reshape(-1, num_classes),
-        shift_labels.reshape(-1),
-        ignore_index=-100,
-    )
-
-
 def _layer_names(hparams) -> List[str]:
     return [hparams.rewrite_module_tmp.format(layer) for layer in hparams.layers]
 
@@ -480,6 +411,31 @@ def _with_sample_count(caches: Dict[str, Dict], n: int) -> Dict[str, Dict]:
     }
 
 
+def _with_token_count(caches: Dict[str, Dict]) -> Dict[str, Dict]:
+    """Copy A/B and keep the token count the K-FAC pass stored in ``num_samples``.
+
+    Both ``layer_stats_kfac_one_pass`` (Wikipedia) and
+    ``layer_stats_kfac_with_txt_tgt`` (edit chunks) return ``total_tokens`` as the
+    third element, so the mix weight becomes the number of tokens that entered
+    each per-token-averaged A/B instead of the number of documents/requests.
+    """
+    return {
+        layer_name: {
+            "A": cache["A"],
+            "B": cache["B"],
+            "num_samples": max(int(cache.get("num_samples", 0)), 1),
+        }
+        for layer_name, cache in caches.items()
+    }
+
+
+def _retention_weight_mode(hparams) -> str:
+    mode = str(getattr(hparams, "retention_weight", "samples") or "samples").lower()
+    if mode not in ("samples", "tokens"):
+        raise ValueError(f"retention_weight must be 'samples' or 'tokens', got {mode!r}")
+    return mode
+
+
 def pair_retention_with_edit(
     retention: Dict[str, Dict],
     edit_cache: Dict[str, Dict],
@@ -503,14 +459,20 @@ def update_retention_eq13(
     retention: Dict[str, Dict],
     new_chunk_cache: Dict[str, Dict],
     t_k: int,
+    weight_mode: str = "tokens",
 ) -> Dict[str, Dict]:
-    """Algorithm 1 sample-weighted mix of post-update edit factors into retention.
+    """Algorithm 1 weighted mix of post-update edit factors into retention.
 
     M_k = M_{k-1} + T_k
     A_bar_k = (M_{k-1} A_bar_{k-1} + T_k A_k) / M_k
-    where T_k = |D_edit^{(k)}| and (A_k, B_k) are estimated on theta_k.
+    where (A_k, B_k) are estimated on theta_k and
+      weight_mode="samples": T_k = |D_edit^{(k)}| (requests in the chunk),
+      weight_mode="tokens":  T_k = tokens that entered (A_k, B_k).
     """
-    incoming = _with_sample_count(new_chunk_cache, t_k)
+    if weight_mode == "tokens":
+        incoming = _with_token_count(new_chunk_cache)
+    else:
+        incoming = _with_sample_count(new_chunk_cache, t_k)
     return combine_layer_to_cov_caches([retention, incoming])
 
 
@@ -595,17 +557,6 @@ def update_model_and_tokenizer_with_appropriate_padding_token(model, tokenizer, 
         tokenizer.add_special_tokens({"pad_token": "[PAD]"})
         model.resize_token_embeddings(len(tokenizer), mean_resizing=False)
         model.config.pad_token_id = tokenizer.pad_token_id
-        model.config.vocab_size = int(len(tokenizer))
-        gen = getattr(model, "generation_config", None)
-        if gen is not None:
-            gen.pad_token_id = tokenizer.pad_token_id
-        lm_head = model.get_output_embeddings()
-        if lm_head is not None and int(lm_head.weight.shape[0]) != len(tokenizer):
-            raise RuntimeError(
-                "resize_token_embeddings did not grow lm_head to match tokenizer "
-                f"({lm_head.weight.shape[0]} vs {len(tokenizer)}); "
-                "Llama pad_id would CUDA-assert in embedding lookup."
-            )
     return model, tokenizer
 
 
@@ -659,6 +610,7 @@ def execute_sft_adam(
     **kwargs: Any,
 ) -> AutoModelForCausalLM:
     print("[execute_sft_adam]Enter the function")
+    device = model.device
     if tok.padding_side != "right":
         tok.padding_side = "right"
     
@@ -693,15 +645,18 @@ def execute_sft_adam(
         for txt, tgt in zip(
             chunks(texts, hparams.batch_size), chunks(targets, hparams.batch_size)
         ):
-            encodings, labels = _tokenize_sft_batch(
-                model, tok, txt, tgt, hparams.max_length
-            )
-            opt.zero_grad(set_to_none=True)
-            loss = _causal_nll(model, encodings, labels)
-            if loss is None or not torch.isfinite(loss):
-                print("[RhoEdit] skip batch: empty target or non-finite loss")
-                continue
+            inputs_targets = [txt_ + tgt_ for txt_, tgt_ in zip(txt, tgt)]
+            encodings = tok(inputs_targets, return_tensors="pt", padding=True, truncation=True, max_length=hparams.max_length).to(device)
+            labels = encodings["input_ids"].clone()
 
+            labels[labels == tok.pad_token_id] = -100
+            for i, prompt in enumerate(txt):
+                prompt_len = len(tok(prompt, add_special_tokens=True, truncation=True, max_length=hparams.max_length)["input_ids"])
+                labels[i, :prompt_len] = -100
+            opt.zero_grad(set_to_none=True)
+            outputs = model(**encodings, labels=labels)
+            loss = outputs.loss
+                
             loss_meter.update(loss.item(), n=labels.size(0))
             if loss.item() >= 1e-2:
                 loss.backward()
@@ -740,6 +695,7 @@ def execute_sft_adam_sequential(
     ``tracker`` (SequentialEditTracker) is optional and only adds per-round
     evaluation/plotting; the edit path is unchanged.
     """
+    device = model.device
     cache_style = getattr(hparams, "edit_cache_style", "sequential")
     
     if tok.padding_side != "right":
@@ -760,17 +716,23 @@ def execute_sft_adam_sequential(
     layer_to_cov_cache_old = calculate_cov_cache_with_old_data(
         model, tok, hparams, force_recompute=False
     )
-    # Algorithm 1: (A_bar_0, B_bar_0, M_0) <- (A_cap, B_cap, N), N = |D_cap|.
-    retention = _with_sample_count(
-        layer_to_cov_cache_old, _cache_sample_size(hparams)
-    )
+    # Algorithm 1: (A_bar_0, B_bar_0, M_0) <- (A_cap, B_cap, N).
+    #   samples: N = |D_cap| documents (cache_sample_num)
+    #   tokens:  N = tokens that entered the Wikipedia K-FAC pass
+    weight_mode = _retention_weight_mode(hparams)
+    if weight_mode == "tokens":
+        retention = _with_token_count(layer_to_cov_cache_old)
+    else:
+        retention = _with_sample_count(
+            layer_to_cov_cache_old, _cache_sample_size(hparams)
+        )
 
     # mix/disable still train the first chunk with the startup wiki+task pair.
     # sequential waits until the current-chunk edit factors are estimated.
     if cache_style == "sequential":
         print(
             "[RhoEdit] edit_cache_style=sequential uses Algorithm 1 "
-            f"(post-update mix, M_0={_retention_sample_count(retention)})."
+            f"(post-update mix, weight={weight_mode}, M_0={_retention_sample_count(retention)})."
         )
         opt = None
     else:
@@ -812,14 +774,31 @@ def execute_sft_adam_sequential(
             for txt, tgt in zip(
                 chunks(txt_edit, hparams.batch_size), chunks(tgt_edit, hparams.batch_size)
             ):
-                encodings, labels = _tokenize_sft_batch(
-                    model, tok, txt, tgt, hparams.max_length
-                )
+                inputs_targets = [txt_ + tgt_ for txt_, tgt_ in zip(txt, tgt)]
+                encodings = tok(
+                    inputs_targets,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=hparams.max_length,
+                ).to(device)
+
+                labels = encodings["input_ids"].clone()
+
+                labels[labels == tok.pad_token_id] = -100
+                for i, prompt in enumerate(txt):
+                    prompt_len = len(
+                        tok(
+                            prompt,
+                            add_special_tokens=True,
+                            truncation=True,
+                            max_length=hparams.max_length,
+                        )["input_ids"]
+                    )
+                    labels[i, :prompt_len] = -100
                 opt.zero_grad()
-                loss = _causal_nll(model, encodings, labels)
-                if loss is None or not torch.isfinite(loss):
-                    print("[RhoEdit] skip batch: empty target or non-finite loss")
-                    continue
+                outputs = model(**encodings, labels=labels)
+                loss = outputs.loss
 
                 if loss.item() >= 1e-2:
                     loss.backward()
@@ -869,8 +848,8 @@ def execute_sft_adam_sequential(
                 f"samples at theta_k, then mix into retention (T_k={t_k})."
             )
             post_cache = estimate_chunk_kfac(txt_edit, tgt_edit, model, tok, hparams)
-            retention = update_retention_eq13(retention, post_cache, t_k)
-            print(f"[RhoEdit] Retention M_k={_retention_sample_count(retention)}.")
+            retention = update_retention_eq13(retention, post_cache, t_k, weight_mode=weight_mode)
+            print(f"[RhoEdit] Retention M_k={_retention_sample_count(retention)} ({weight_mode}).")
             state_ref = retention
 
         elif cache_style == "mix":
