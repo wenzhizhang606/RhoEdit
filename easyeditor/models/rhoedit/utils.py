@@ -532,6 +532,8 @@ def calculate_projection_caches_from_cov_caches(
         if not _is_llama_or_phi(hparams.model_name):
             task_A, task_B = task_B, task_A
 
+        task_A = torch.eye(task_A.shape[0], device=device, dtype=task_A.dtype)
+        task_B = torch.eye(task_B.shape[0], device=device, dtype=task_B.dtype)
         task_projection_cache = calculate_projection_cache_with_kfac(task_A, task_B)
         projection_cache.update(
             {

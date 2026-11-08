@@ -156,7 +156,7 @@ def get_hparams(args):
 def calculate_model_name(args, hparams):
     name = (f"{args.model}_rhoedit_adam_{args.data_type}"
                         f"_{hparams.task_mom2_dataset}"
-                        f"_{hparams.newton_damping}_{hparams.soft_lambda}_{hparams.lr}_now_")
+                        f"_{hparams.newton_damping}_{hparams.soft_lambda}_{hparams.lr}")
 
     if args.sequential_edit:
         name += f"_sequential_{args.num_edits}"
@@ -166,7 +166,7 @@ def calculate_model_name(args, hparams):
     if args.sequential_edit:
         name += f"_edit_cache_{args.edit_cache_style}"
         if args.retention_weight != 'samples':
-            name += f"_w{args.retention_weight}_20260923"
+            name += f"_w{args.retention_weight}"
 
     return name.replace('.', '_')
 
@@ -186,54 +186,10 @@ if __name__ == "__main__":
     if os.path.exists(HF_CACHE_DIR+MODEL_NAME):
         MODEL_NAME=HF_CACHE_DIR+MODEL_NAME
     print(f" Load model path as:{MODEL_NAME}")
-    '''
-    #最终需要保留
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME,local_files_only=True)
     model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, device_map='auto',  
                                     local_files_only=True)
-    '''
-    '''
-    #qwen2.5
-    tokenizer = AutoTokenizer.from_pretrained(
-        MODEL_NAME,
-        local_files_only=True,
-    )
 
-    config = AutoConfig.from_pretrained(
-        MODEL_NAME,
-        local_files_only=True,
-    )
-
-    device_map = {
-        "model.embed_tokens": 1,
-        "model.rotary_emb": 1,
-    }
-
-    for layer in range(config.num_hidden_layers):
-        device_map[f"model.layers.{layer}"] = 0 if  12 <= layer <= 19 else 1
-
-    device_map["model.norm"] = 1
-    device_map["lm_head"] = 1
-
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        device_map=device_map,
-        local_files_only=True,
-    )
-    '''
-    # llama3
-    tokenizer = AutoTokenizer.from_pretrained(
-        MODEL_NAME,
-        cache_dir=HF_CACHE_DIR,
-        local_files_only=True,
-    )
-
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        cache_dir=HF_CACHE_DIR,
-        device_map="auto",
-        local_files_only=True,
-    )
     
     # set appropriate padding token
     model, tokenizer = update_model_and_tokenizer_with_appropriate_padding_token(model, tokenizer, hparams)
