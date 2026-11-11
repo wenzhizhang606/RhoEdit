@@ -1,3 +1,5 @@
+import os
+from pathlib import Path
 from typing import Dict, Optional
 
 import torch
@@ -8,6 +10,7 @@ from torch.optim import Adam
 load_dotenv()
 
 class ProjectedAdam(Adam):
+    _BASIS_CACHE_VERSION = 1
     _PRECOMPUTED_BASIS_KEYS = (
         (
             "soft_q_a",
@@ -215,6 +218,7 @@ class ProjectedAdam(Adam):
         cache: Dict,
         dtype: torch.dtype,
     ):
+        self._load_basis_cache(cache)
         for (
             q_a_key,
             q_b_key,
@@ -248,6 +252,80 @@ class ProjectedAdam(Adam):
                 )
         return None
 
+    @classmethod
+    def _basis_payload(cls, cache: Dict):
+        return {
+            "version": cls._BASIS_CACHE_VERSION,
+            "soft_q_a": cache["soft_q_a"].detach().cpu().contiguous(),
+            "soft_q_b": cache["soft_q_b"].detach().cpu().contiguous(),
+            "soft_dual_q_a": cache["soft_dual_q_a"].detach().cpu().contiguous(),
+            "soft_dual_q_b": cache["soft_dual_q_b"].detach().cpu().contiguous(),
+            "soft_eig_a": cache["soft_eig_a"].detach().cpu().contiguous(),
+            "soft_eig_b": cache["soft_eig_b"].detach().cpu().contiguous(),
+            "factor_damping": float(cache.get("basis_factor_damping", 0.0)),
+        }
+
+    def _load_basis_cache(self, cache: Dict) -> None:
+        if all(key in cache for key in self._PRECOMPUTED_BASIS_KEYS[0]):
+            return
+        cache_path = cache.get("basis_cache_path")
+        if not cache_path:
+            return
+
+        path = Path(cache_path)
+        try:
+            payload = torch.load(path, map_location="cpu", weights_only=True)
+        except FileNotFoundError:
+            return
+        except Exception as exc:
+            print(f"[RhoEdit] Ignoring unreadable K-FAC eigencache {path}: {exc}")
+            return
+
+        if not isinstance(payload, dict) or payload.get("version") != self._BASIS_CACHE_VERSION:
+            return
+        cached_damping = float(payload.get("factor_damping", self.factor_damping))
+        if abs(cached_damping - self.factor_damping) > 1e-15:
+            return
+        keys = self._PRECOMPUTED_BASIS_KEYS[0]
+        if not all(key in payload and isinstance(payload[key], torch.Tensor) for key in keys):
+            return
+        expected_shapes = {
+            "soft_q_a": tuple(cache["edit_A"].shape),
+            "soft_q_b": tuple(cache["edit_B"].shape),
+            "soft_dual_q_a": tuple(cache["edit_A"].shape),
+            "soft_dual_q_b": tuple(cache["edit_B"].shape),
+            "soft_eig_a": (cache["edit_A"].shape[0],),
+            "soft_eig_b": (cache["edit_B"].shape[0],),
+        }
+        if any(tuple(payload[key].shape) != shape for key, shape in expected_shapes.items()):
+            return
+        cache.update({key: payload[key].detach().cpu().contiguous() for key in keys})
+        print(f"[RhoEdit] Loaded cached K-FAC eigendecomposition from {path}")
+
+    def _save_basis_cache(self, cache: Dict) -> None:
+        cache_path = cache.get("basis_cache_path")
+        if not cache_path:
+            return
+        if not all(key in cache for key in self._PRECOMPUTED_BASIS_KEYS[0]):
+            return
+
+        path = Path(cache_path)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = self._basis_payload(cache)
+            payload["factor_damping"] = float(self.factor_damping)
+            tmp_path = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+            torch.save(payload, tmp_path)
+            os.replace(tmp_path, path)
+            print(f"[RhoEdit] Saved K-FAC eigendecomposition to {path}")
+        except (OSError, RuntimeError):
+            # A read-only or full cache directory must not stop editing.
+            try:
+                if "tmp_path" in locals() and tmp_path.exists():
+                    tmp_path.unlink()
+            except OSError:
+                pass
+
     def _factors_from_cache(self, tensor: torch.Tensor, cache: Dict, dtype: torch.dtype):
         for edit_keys, cap_keys in self._FACTOR_KEY_SETS:
             if all(key in cache for key in (*edit_keys, *cap_keys)):
@@ -277,6 +355,11 @@ class ProjectedAdam(Adam):
             cache["soft_dual_q_b"] = dual_q_b.detach().cpu()
             cache["soft_eig_a"] = eig_a.detach().cpu()
             cache["soft_eig_b"] = eig_b.detach().cpu()
+
+        # Persist the decomposition so a later run can skip both generalized
+        # eigendecompositions. The factors and damping are encoded in the path.
+        cache["basis_factor_damping"] = self.factor_damping
+        self._save_basis_cache(cache)
 
         # CPU decompositions are cached on CPU; only their results are needed
         # on the gradient's device for the spectral filter below.

@@ -1,6 +1,9 @@
 import gc
+import hashlib
 import os
+import re
 from copy import deepcopy
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -22,6 +25,7 @@ from easyeditor.tools import ExperimentTracker
 
 load_dotenv()
 STATS_DIR = os.getenv("STATS_DIR")
+EIGEN_CACHE_VERSION = 1
 
 # Only used when loading K-FAC stats. Edit JSON loading stays in the root utils.py.
 KFAC_DATASET_ALIASES = {
@@ -127,6 +131,34 @@ def _build_cov_cache_from_hparams(
 
 def _to_cpu_float32(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.to("cpu", dtype=torch.float32).contiguous()
+
+
+def _tensor_digest(tensor: torch.Tensor, digest) -> None:
+    """Add a tensor's shape, dtype, and values to a cache identity digest."""
+    value = tensor.detach().to(device="cpu").contiguous()
+    digest.update(str(tuple(value.shape)).encode("ascii"))
+    digest.update(str(value.dtype).encode("ascii"))
+    digest.update(memoryview(value.view(torch.uint8).numpy()).cast("B"))
+
+
+def _basis_cache_path(model, hparams, layer_name: str, projection_cache: Dict) -> Optional[str]:
+    """Build a persistent path for the generalized K-FAC basis of one layer."""
+    if not STATS_DIR:
+        return None
+
+    digest = hashlib.sha256()
+    for key in ("edit_A", "edit_B", "cap_A", "cap_B"):
+        digest.update(key.encode("ascii"))
+        _tensor_digest(projection_cache[key], digest)
+    damping = float(getattr(hparams, "newton_damping", 1e-5))
+    digest.update(f"|damping={damping:.17g}|version={EIGEN_CACHE_VERSION}".encode("ascii"))
+    cache_key = digest.hexdigest()
+
+    model_name = str(model.config._name_or_path).replace("\\", "/").rstrip("/").split("/")[-1]
+    model_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", model_name) or "model"
+    safe_layer = re.sub(r"[^A-Za-z0-9_.-]+", "_", layer_name)
+    cache_dir = Path(STATS_DIR) / model_name / "rhoedit_eigendecomp"
+    return str(cache_dir / f"{safe_layer}_{cache_key[:32]}.pt")
 
 
 def calculate_projection_cache_with_kfac(A, B):
@@ -541,6 +573,9 @@ def calculate_projection_caches_from_cov_caches(
             }
         )
         projection_cache["layer_name"] = layer_name
+        projection_cache["basis_cache_path"] = _basis_cache_path(
+            model, hparams, layer_name, projection_cache
+        )
         weight_to_projection_cache[_find_weight_for_layer(weights, layer_name)] = projection_cache
 
         del A, B, task_A, task_B
